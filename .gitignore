@@ -4,6 +4,7 @@ cityscale/
 spacenet/
 sam_ckpts/
 training_data/
+dataset/
 
 # 排除模型权重文件
 *.pth

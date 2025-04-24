@@ -6,6 +6,7 @@ import os
 import glob
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
+from collections import Counter
 
 class LoveDADataset(Dataset):
     """
@@ -47,8 +48,17 @@ class LoveDADataset(Dataset):
             img_dir = os.path.join(root_dir, split, region, 'images_png')
             mask_dir = os.path.join(root_dir, split, region, 'masks_png')
             
+            if not os.path.exists(img_dir):
+                print(f"警告: 图像目录不存在: {img_dir}")
+                continue
+                
+            if not os.path.exists(mask_dir):
+                print(f"警告: 掩码目录不存在: {mask_dir}")
+                continue
+            
             img_files = glob.glob(os.path.join(img_dir, '*.png'))
             
+            region_count = 0
             for img_path in img_files:
                 img_filename = os.path.basename(img_path)
                 mask_path = os.path.join(mask_dir, img_filename)
@@ -56,6 +66,11 @@ class LoveDADataset(Dataset):
                 if os.path.exists(mask_path):
                     self.image_paths.append(img_path)
                     self.mask_paths.append(mask_path)
+                    region_count += 1
+                else:
+                    print(f"警告: 找不到对应掩码文件: {mask_path}")
+            
+            print(f"已加载 {region} 区域的 {region_count} 个样本")
     
     def __len__(self):
         return len(self.image_paths)
@@ -118,6 +133,46 @@ class LoveDADataset(Dataset):
             'mask_path': mask_path
         }
 
+    def get_class_distribution(self):
+        """计算数据集的类别分布"""
+        print(f"计算 {self.split} 集的类别分布...")
+        class_counts = Counter()
+        class_pixels = Counter()
+        total_pixels = 0
+        
+        for mask_path in self.mask_paths:
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            # 统计像素分布
+            unique_values, counts = np.unique(mask, return_counts=True)
+            for val, count in zip(unique_values, counts):
+                class_pixels[int(val)] += count
+                total_pixels += count
+            # 统计样本中出现的类别
+            for val in unique_values:
+                class_counts[int(val)] += 1
+        
+        class_names = ["忽略区域", "背景", "建筑", "道路", "水体", "荒地", "森林", "农田"]
+        
+        print(f"\n{self.split} 集的类别分布:")
+        print(f"{'类别ID':<10}{'类别名称':<10}{'出现样本数':<15}{'占比(%)':<10}{'像素数':<15}{'像素占比(%)':<15}")
+        print('-' * 75)
+        
+        for class_id in sorted(class_counts.keys()):
+            if class_id < len(class_names):
+                class_name = class_names[class_id]
+            else:
+                class_name = f"未知({class_id})"
+            
+            sample_count = class_counts[class_id]
+            sample_percent = sample_count / len(self.mask_paths) * 100
+            pixel_count = class_pixels[class_id]
+            pixel_percent = pixel_count / total_pixels * 100
+            
+            print(f"{class_id:<10}{class_name:<10}{sample_count:<15}{sample_percent:.2f}%{pixel_count:<15}{pixel_percent:.2f}%")
+        
+        print('-' * 75)
+        return class_counts, class_pixels
+
 
 def create_loveda_dataloaders(config):
     """
@@ -143,6 +198,7 @@ def create_loveda_dataloaders(config):
     test_split = split_info.get('TEST', 'test')
     
     # 打印找到的数据路径信息(调试用)
+    print(f"\n{'-'*20} 数据集信息 {'-'*20}")
     print(f"数据集根目录: {root_dir}")
     print(f"使用区域: {regions}")
     print(f"图像尺寸: {patch_size}x{patch_size}")
@@ -152,9 +208,16 @@ def create_loveda_dataloaders(config):
     val_dataset = LoveDADataset(root_dir, split=val_split, regions=regions, patch_size=patch_size)
     test_dataset = LoveDADataset(root_dir, split=test_split, regions=regions, patch_size=patch_size)
     
-    print(f"训练集样本数: {len(train_dataset)}")
+    print(f"\n训练集样本数: {len(train_dataset)}")
     print(f"验证集样本数: {len(val_dataset)}")
     print(f"测试集样本数: {len(test_dataset)}")
+    
+    # 计算类别分布
+    if len(train_dataset) > 0:
+        train_dataset.get_class_distribution()
+    
+    if len(val_dataset) > 0:
+        val_dataset.get_class_distribution()
     
     train_loader = DataLoader(
         train_dataset, 
@@ -176,6 +239,11 @@ def create_loveda_dataloaders(config):
         shuffle=False, 
         num_workers=num_workers
     )
+    
+    print(f"\n训练批次数: {len(train_loader)}")
+    print(f"验证批次数: {len(val_loader)}")
+    print(f"测试批次数: {len(test_loader)}")
+    print(f"{'-'*53}\n")
     
     return train_loader, val_loader, test_loader
 
@@ -212,25 +280,37 @@ def visualize_sample(sample):
     fig, axs = plt.subplots(2, 3, figsize=(15, 10))
     
     axs[0, 0].imshow(img)
-    axs[0, 0].set_title(f"original image - {sample['region']} - {sample['sample_id']}")
+    axs[0, 0].set_title(f"原始图像 - {sample['region']} - {sample['sample_id']}")
     
     axs[0, 1].imshow(colored_mask)
-    axs[0, 1].set_title('classification mask')
+    axs[0, 1].set_title('分类掩码')
     
     axs[0, 2].imshow(road_mask, cmap='gray')
-    axs[0, 2].set_title('road mask')
+    axs[0, 2].set_title('道路掩码')
     
     axs[1, 0].imshow(building_mask, cmap='gray')
-    axs[1, 0].set_title('building mask')
+    axs[1, 0].set_title('建筑掩码')
     
     axs[1, 1].imshow(water_mask, cmap='gray')
-    axs[1, 1].set_title('water mask')
+    axs[1, 1].set_title('水体掩码')
     
-    # 空出一个位置
+    # 打印类别统计
+    class_stats = []
+    for i, name in enumerate(["忽略区域", "背景", "建筑", "道路", "水体", "荒地", "森林", "农田"]):
+        pixels = np.sum(mask == i)
+        percent = pixels / mask.size * 100
+        class_stats.append(f"{name}: {pixels} ({percent:.1f}%)")
+    
     axs[1, 2].axis('off')
+    axs[1, 2].text(0, 0.5, '\n'.join(class_stats), fontsize=10)
+    axs[1, 2].set_title('类别统计')
     
     plt.tight_layout()
     plt.show()
+    
+    # 打印图像路径信息
+    print(f"图像路径: {sample['img_path']}")
+    print(f"掩码路径: {sample['mask_path']}")
 
 
 if __name__ == "__main__":
@@ -242,9 +322,15 @@ if __name__ == "__main__":
     dataset = LoveDADataset(root_dir, split='Train')
     print(f"数据集大小: {len(dataset)}")
     
+    # 显示类别分布
+    dataset.get_class_distribution()
+    
     # 获取并可视化一个样本
-    sample = dataset[0]
-    visualize_sample(sample)
+    if len(dataset) > 0:
+        sample = dataset[0]
+        visualize_sample(sample)
+    else:
+        print("数据集为空，无法可视化样本")
     
     # 创建数据加载器
     dataloaders = create_loveda_dataloaders(root_dir, batch_size=4)

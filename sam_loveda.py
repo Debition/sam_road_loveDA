@@ -336,6 +336,9 @@ class SAMLoveDA(pl.LightningModule):
             else:
                 print("No checkpoint path provided, using random initialization")
 
+        # 打印参数统计信息
+        self._print_param_stats()
+
     def resize_sam_pos_embed(self, state_dict, image_size, vit_patch_size, encoder_global_attn_indexes):
         # 调整预训练SAM模型的位置编码以匹配当前的图像尺寸
         new_state_dict = {k : v for k, v in state_dict.items()}
@@ -537,18 +540,30 @@ class SAMLoveDA(pl.LightningModule):
         
         # 计算所有类别的二分类损失
         total_class_loss = 0.0
+        class_ious = []
         for cls_idx in range(1, self.num_classes):  # 跳过背景类
             # 为每个类别创建二值掩码
             class_mask = (masks == cls_idx).float()
             
             # 获取该类别的logits
             class_logit = mask_logits[:, cls_idx]
+            class_pred = (torch.sigmoid(class_logit) > 0.5).float()
             
             # 计算二分类损失
             class_loss = F.binary_cross_entropy_with_logits(class_logit, class_mask)
             
             # 累加损失
             total_class_loss += class_loss
+            
+            # 计算每个类别的IoU
+            if class_mask.sum() > 0:  # 只有当存在该类别时才计算IoU
+                intersection = (class_pred * class_mask).sum()
+                union = class_pred.sum() + class_mask.sum() - intersection
+                class_iou = intersection / (union + 1e-6)
+                class_ious.append(class_iou)
+                
+                # 记录各类别IoU
+                self.log(f'train_{class_names[cls_idx]}_iou', class_iou, on_step=False, on_epoch=True)
             
             # 记录各类别损失
             self.log(f'train_{class_names[cls_idx]}_loss', class_loss, on_step=True, on_epoch=False)
@@ -562,6 +577,25 @@ class SAMLoveDA(pl.LightningModule):
         self.log('train_loss', total_loss, on_step=True, on_epoch=False, prog_bar=True)
         self.log('train_mean_iou', mean_iou, on_step=True, on_epoch=False, prog_bar=True)
         self.log('train_class_loss', total_class_loss / (self.num_classes - 1), on_step=True, on_epoch=False)
+        
+        # 每一定步数打印训练状态
+        log_interval = self.config.get('LOG_INTERVAL', 50)
+        if self.global_step > 0 and batch_idx % log_interval == 0:
+            # 计算当前学习率
+            current_lr = self.trainer.optimizers[0].param_groups[0]['lr']
+            
+            # 计算平均类别IoU
+            avg_class_iou = sum(class_ious) / len(class_ious) if class_ious else 0
+            
+            # 打印训练状态
+            batch_str = f"[{batch_idx}/{len(self.trainer.train_dataloader)}]"
+            epoch_str = f"Epoch {self.current_epoch+1}/{self.trainer.max_epochs}"
+            lr_str = f"LR: {current_lr:.6f}"
+            loss_str = f"Loss: {total_loss.item():.4f}"
+            iou_str = f"IoU: {mean_iou.item():.4f}"
+            cls_iou_str = f"ClsIoU: {avg_class_iou:.4f}"
+            
+            print(f"{epoch_str} {batch_str} {lr_str} {loss_str} {iou_str} {cls_iou_str}")
         
         # 如果是第一个批次，记录一些预览图像
         if batch_idx == 0 and self.current_epoch % 5 == 0:
@@ -588,7 +622,11 @@ class SAMLoveDA(pl.LightningModule):
         # 计算IoU
         mean_iou = self.mean_iou(preds, masks)
         
+        # 类别名称
+        class_names = ["背景", "建筑", "道路", "水体", "草地", "森林", "农田", "其他"]
+        
         # 创建二分类任务的目标掩码，主要关注1-7类，跳过0类（背景）
+        class_scores = {}
         for cls_idx in range(1, self.num_classes):
             # 为每个类别创建二值掩码
             class_mask = (masks == cls_idx).float()
@@ -600,6 +638,13 @@ class SAMLoveDA(pl.LightningModule):
             # 计算该类别的IoU和F1分数
             self.class_ious[cls_idx-1].update(class_pred, class_mask)
             self.class_f1s[cls_idx-1].update(class_pred, class_mask)
+            
+            # 计算本批次的类别IoU
+            if class_mask.sum() > 0:
+                intersection = (class_pred * class_mask).sum()
+                union = class_pred.sum() + class_mask.sum() - intersection
+                class_iou = (intersection / (union + 1e-6)).item()
+                class_scores[class_names[cls_idx]] = class_iou
             
             # 单独记录道路、建筑和水体的IoU
             if cls_idx == 1:  # 建筑
@@ -617,23 +662,82 @@ class SAMLoveDA(pl.LightningModule):
         # 存储指标用于epoch结束时的汇总
         self.val_mean_iou_list.append(mean_iou)
         
+        # 每个验证周期开始时打印一些信息
+        if batch_idx == 0:
+            print(f"\n验证: Epoch {self.current_epoch+1}/{self.trainer.max_epochs}")
+        
         # 如果是第一个批次，记录一些预览图像
         if batch_idx == 0:
             self._log_images(batch, mask_logits)
-        
-        return loss
+
+        # 返回验证批次指标
+        return {'val_loss': loss, 'val_mean_iou': mean_iou, 'class_scores': class_scores}
 
     def on_validation_epoch_end(self):
+        # 类别名称
+        class_names = ["背景", "建筑", "道路", "水体", "草地", "森林", "农田", "其他"]
+        
+        # 收集并显示所有类别的IoU
+        class_iou_values = []
+        class_f1_values = []
+        
+        # 打印验证结果标题
+        print("\n" + "="*60)
+        print(f"验证结果 - Epoch {self.current_epoch+1}")
+        print("="*60)
+        
+        # 打印类别指标
+        print(f"{'类别':<10}{'IoU':<10}{'F1':<10}")
+        print("-"*30)
+        
         for cls_idx in range(1, self.num_classes):
             class_iou = self.class_ious[cls_idx-1].compute()
             class_f1 = self.class_f1s[cls_idx-1].compute()
             
+            class_iou_values.append(class_iou.item())
+            class_f1_values.append(class_f1.item())
+            
             self.log(f'val_class_{cls_idx}_iou', class_iou)
             self.log(f'val_class_{cls_idx}_f1', class_f1)
+            
+            # 打印每个类别的指标
+            print(f"{class_names[cls_idx]:<10}{class_iou.item():.4f}{class_f1.item():>10.4f}")
+            
+            # 存储验证指标
+            self.val_class_ious_list[cls_idx-1].append(class_iou.item())
             
             # 重置指标
             self.class_ious[cls_idx-1].reset()
             self.class_f1s[cls_idx-1].reset()
+        
+        # 计算平均指标
+        mean_class_iou = sum(class_iou_values) / len(class_iou_values)
+        mean_class_f1 = sum(class_f1_values) / len(class_f1_values)
+        
+        print("-"*30)
+        print(f"{'平均':<10}{mean_class_iou:.4f}{mean_class_f1:>10.4f}")
+        print("="*60)
+        
+        # 记录平均类别指标
+        self.log('val_mean_class_iou', mean_class_iou)
+        self.log('val_mean_class_f1', mean_class_f1)
+        
+        # 打印当前最佳结果
+        current_iou = self.trainer.callback_metrics.get('val_mean_iou', 0)
+        
+        try:
+            best_model_path = self.trainer.checkpoint_callback.best_model_path
+            best_score = self.trainer.checkpoint_callback.best_model_score
+            
+            if best_score is not None:
+                print(f"当前验证IoU: {current_iou:.4f} - 最佳IoU: {best_score:.4f}")
+                if best_model_path:
+                    print(f"最佳模型: {best_model_path}")
+            else:
+                print(f"当前验证IoU: {current_iou:.4f}")
+        except Exception as e:
+            # 如果出错就简单打印当前指标
+            print(f"当前验证IoU: {current_iou:.4f}")
 
     def test_step(self, batch, batch_idx):
         # 前向传播
@@ -649,6 +753,7 @@ class SAMLoveDA(pl.LightningModule):
         mean_iou = self.mean_iou(preds, masks)
         
         # 为测试集记录更详细的分析
+        class_metrics = {}
         for cls_idx in range(1, self.num_classes):
             # 为每个类别创建二值掩码
             class_mask = (masks == cls_idx).float()
@@ -659,27 +764,77 @@ class SAMLoveDA(pl.LightningModule):
             
             # 更新PR曲线计算器，稍后用于找到最佳阈值
             self.class_pr_curves[cls_idx-1].update(class_pred, class_mask.int())
+            
+            # 如果当前批次中存在该类别，计算指标
+            if class_mask.sum() > 0:
+                # 使用阈值0.5计算二值预测
+                binary_pred = (class_pred > 0.5).float()
+                
+                # 计算精确度、召回率和F1
+                tp = (binary_pred * class_mask).sum()
+                pred_pos = binary_pred.sum()
+                actual_pos = class_mask.sum()
+                
+                precision = tp / (pred_pos + 1e-6)
+                recall = tp / (actual_pos + 1e-6)
+                f1 = 2 * precision * recall / (precision + recall + 1e-6)
+                
+                # 计算IoU
+                intersection = tp
+                union = pred_pos + actual_pos - tp
+                iou = intersection / (union + 1e-6)
+                
+                # 存储指标
+                class_metrics[f"cls_{cls_idx}_prec"] = precision.item()
+                class_metrics[f"cls_{cls_idx}_rec"] = recall.item()
+                class_metrics[f"cls_{cls_idx}_f1"] = f1.item()
+                class_metrics[f"cls_{cls_idx}_iou"] = iou.item()
+        
+        # 打印测试进度
+        if batch_idx == 0 or (batch_idx + 1) % 10 == 0:
+            print(f"测试: 批次 [{batch_idx+1}/{len(self.trainer.test_dataloaders)}] IoU: {mean_iou:.4f}")
         
         self.log('test_mean_iou', mean_iou)
         
-        return {'test_mean_iou': mean_iou}
+        # 添加更多的测试日志
+        return {'test_mean_iou': mean_iou, **class_metrics}
 
     def on_test_epoch_end(self):
-        # 找到每个类别的最佳阈值
-        print('======= Finding best thresholds ======')
+        # 类别名称
         class_names = ["背景", "建筑", "道路", "水体", "草地", "森林", "农田", "其他"]
         
+        # 找到每个类别的最佳阈值
+        print('\n' + '='*60)
+        print('测试结果摘要')
+        print('='*60)
+        print('找到各类别的最佳阈值:')
+        print(f"{'类别':<10}{'最佳阈值':<10}{'精确度':<10}{'召回率':<10}{'F1':<10}")
+        print('-'*60)
+        
         for cls_idx in range(1, self.num_classes):
-            print(f'======= {class_names[cls_idx]} ======')   
+            print(f'分析类别: {class_names[cls_idx]}')   
             precision, recall, thresholds = self.class_pr_curves[cls_idx-1].compute()
-            f1_scores = 2 * (precision * recall) / (precision + recall + 1e-10)
-            best_idx = torch.argmax(f1_scores)
-            best_threshold = thresholds[best_idx]
-            best_precision = precision[best_idx]
-            best_recall = recall[best_idx]
-            best_f1 = f1_scores[best_idx]
             
-            print(f'Best threshold {best_threshold}, P={best_precision} R={best_recall} F1={best_f1}')
+            # 计算所有阈值的F1分数
+            f1_scores = 2 * (precision * recall) / (precision + recall + 1e-10)
+            
+            # 找到最佳F1分数对应的索引
+            if len(thresholds) > 0:
+                best_idx = torch.argmax(f1_scores)
+                best_threshold = thresholds[best_idx]
+                best_precision = precision[best_idx]
+                best_recall = recall[best_idx]
+                best_f1 = f1_scores[best_idx]
+                
+                print(f"{class_names[cls_idx]:<10}{best_threshold:.4f}{best_precision:.4f}{best_recall:>10.4f}{best_f1:>10.4f}")
+            else:
+                print(f"{class_names[cls_idx]:<10}N/A      N/A      N/A      N/A")
+        
+        print('='*60)
+        
+        # 重置指标
+        for idx in range(1, self.num_classes):
+            self.class_pr_curves[idx-1].reset()
 
     def _log_images(self, batch, logits, max_images=4):
         """记录图像用于可视化"""
@@ -853,6 +1008,71 @@ class SAMLoveDA(pl.LightningModule):
             return torch.tensor(sum(ious) / len(ious), device=pred.device)
         else:
             return torch.tensor(0.0, device=pred.device)
+
+    def _print_param_stats(self):
+        """打印模型参数统计信息，包括总参数、加载参数、冻结和可训练参数的数量"""
+        print("\n" + "="*60)
+        print("模型参数统计")
+        print("="*60)
+        
+        # 总参数
+        total_params = sum(p.numel() for p in self.parameters())
+        print(f"总参数数量: {total_params:,}")
+        
+        # 可训练参数
+        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        frozen_params = total_params - trainable_params
+        print(f"可训练参数数量: {trainable_params:,} ({trainable_params/total_params*100:.2f}%)")
+        print(f"冻结参数数量: {frozen_params:,} ({frozen_params/total_params*100:.2f}%)")
+        
+        # 按组件划分的参数统计
+        encoder_params = sum(p.numel() for name, p in self.named_parameters() if 'image_encoder' in name)
+        encoder_train_params = sum(p.numel() for name, p in self.named_parameters() if 'image_encoder' in name and p.requires_grad)
+        print(f"\n图像编码器参数: {encoder_params:,}")
+        print(f"  - 可训练: {encoder_train_params:,} ({encoder_train_params/encoder_params*100:.2f}%)")
+        print(f"  - 冻结: {encoder_params-encoder_train_params:,} ({(encoder_params-encoder_train_params)/encoder_params*100:.2f}%)")
+        
+        # 根据解码器类型统计参数
+        if self.config.USE_SAM_DECODER:
+            decoder_params = sum(p.numel() for name, p in self.named_parameters() if 'mask_decoder' in name)
+            decoder_train_params = sum(p.numel() for name, p in self.named_parameters() if 'mask_decoder' in name and p.requires_grad)
+            print(f"\nSAM解码器参数: {decoder_params:,}")
+            print(f"  - 可训练: {decoder_train_params:,} ({decoder_train_params/decoder_params*100:.2f}%)")
+            print(f"  - 冻结: {decoder_params-decoder_train_params:,} ({(decoder_params-decoder_train_params)/decoder_params*100:.2f}%)")
+        else:
+            decoder_params = sum(p.numel() for name, p in self.named_parameters() if 'map_decoder' in name)
+            decoder_train_params = sum(p.numel() for name, p in self.named_parameters() if 'map_decoder' in name and p.requires_grad)
+            print(f"\n自定义解码器参数: {decoder_params:,}")
+            print(f"  - 可训练: {decoder_train_params:,} ({decoder_train_params/decoder_params*100:.2f}%)")
+            print(f"  - 冻结: {decoder_params-decoder_train_params:,} ({(decoder_params-decoder_train_params)/decoder_params*100:.2f}%)")
+        
+        # 提示编码器参数
+        prompt_params = sum(p.numel() for name, p in self.named_parameters() if 'prompt_encoder' in name)
+        prompt_train_params = sum(p.numel() for name, p in self.named_parameters() if 'prompt_encoder' in name and p.requires_grad)
+        print(f"\n提示编码器参数: {prompt_params:,}")
+        if prompt_params > 0:
+            print(f"  - 可训练: {prompt_train_params:,} ({prompt_train_params/prompt_params*100:.2f}%)")
+            print(f"  - 冻结: {prompt_params-prompt_train_params:,} ({(prompt_params-prompt_train_params)/prompt_params*100:.2f}%)")
+        else:
+            print("  - 可训练: 0 (0.00%)")
+            print("  - 冻结: 0 (0.00%)")
+        
+        # LoRA参数统计
+        if hasattr(self, 'w_As') and self.w_As:
+            lora_params = sum(p.numel() for w_A in self.w_As for p in w_A.parameters()) + \
+                         sum(p.numel() for w_B in self.w_Bs for p in w_B.parameters())
+            print(f"\nLoRA参数: {lora_params:,} (全部可训练)")
+            lora_percent = lora_params / trainable_params * 100
+            print(f"LoRA参数占可训练参数的比例: {lora_percent:.2f}%")
+            print(f"LoRA秩: {self.config.get('LORA_RANK', 4)}")
+        
+        # 加载参数统计
+        if hasattr(self, 'matched_param_names'):
+            loaded_params_count = sum(p.numel() for name, p in self.named_parameters() 
+                                      if any(name.endswith(key.split('.')[-1]) for key in self.matched_param_names))
+            print(f"\n从预训练权重加载的参数数量: {loaded_params_count:,} ({loaded_params_count/total_params*100:.2f}%)")
+        
+        print("="*60)
 
 
 # ===================== 以下是用于测试与调试的代码 =====================
