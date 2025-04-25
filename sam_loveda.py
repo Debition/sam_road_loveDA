@@ -277,9 +277,21 @@ class SAMLoveDA(pl.LightningModule):
 
         #### 损失函数
         if config.get('FOCAL_LOSS', False):
-            self.mask_criterion = partial(torchvision.ops.sigmoid_focal_loss, reduction='mean')
+            alpha = config.get('FOCAL_ALPHA', 0.25)
+            gamma = config.get('FOCAL_GAMMA', 2.0)
+            logger.info(f"使用Focal Loss - alpha={alpha}, gamma={gamma}")
+            self.mask_criterion = partial(torchvision.ops.sigmoid_focal_loss, 
+                                         alpha=alpha, 
+                                         gamma=gamma, 
+                                         reduction='mean')
         else:
-            self.mask_criterion = nn.CrossEntropyLoss(ignore_index=0)
+            # 检查是否有类别权重
+            if config.get('CLASS_WEIGHTS', None) is not None:
+                weights = torch.tensor(config.CLASS_WEIGHTS, dtype=torch.float)
+                logger.info(f"使用加权交叉熵损失 - 权重={weights}")
+                self.mask_criterion = nn.CrossEntropyLoss(weight=weights, ignore_index=0)
+            else:
+                self.mask_criterion = nn.CrossEntropyLoss(ignore_index=0)
 
         # 创建IoU度量
         self.mean_iou = JaccardIndex(task="multiclass", num_classes=self.num_classes, ignore_index=0)
@@ -513,7 +525,7 @@ class SAMLoveDA(pl.LightningModule):
         class_names = ["背景", "建筑", "道路", "水体", "草地", "森林", "农田", "其他"]
         class_losses = []
         
-        # 重点关注的类别 - 与以前相同
+        # 重点关注的类别
         road_mask = (masks == 2).float()
         building_mask = (masks == 1).float()
         water_mask = (masks == 3).float()
@@ -522,9 +534,17 @@ class SAMLoveDA(pl.LightningModule):
         building_logits = mask_logits[:, 1]
         water_logits = mask_logits[:, 3]
         
-        road_loss = F.binary_cross_entropy_with_logits(road_logits, road_mask)
-        building_loss = F.binary_cross_entropy_with_logits(building_logits, building_mask)
-        water_loss = F.binary_cross_entropy_with_logits(water_logits, water_mask)
+        # 使用Focal Loss或BCE
+        if self.config.get('FOCAL_LOSS', False):
+            alpha = self.config.get('FOCAL_ALPHA', 0.25)
+            gamma = self.config.get('FOCAL_GAMMA', 2.0)
+            road_loss = torchvision.ops.sigmoid_focal_loss(road_logits, road_mask, alpha=alpha, gamma=gamma, reduction='mean')
+            building_loss = torchvision.ops.sigmoid_focal_loss(building_logits, building_mask, alpha=alpha, gamma=gamma, reduction='mean')
+            water_loss = torchvision.ops.sigmoid_focal_loss(water_logits, water_mask, alpha=alpha, gamma=gamma, reduction='mean')
+        else:
+            road_loss = F.binary_cross_entropy_with_logits(road_logits, road_mask)
+            building_loss = F.binary_cross_entropy_with_logits(building_logits, building_mask)
+            water_loss = F.binary_cross_entropy_with_logits(water_logits, water_mask)
         
         # 调试
         if logger.level <= logging.DEBUG and batch_idx % 100 == 0:
@@ -683,7 +703,10 @@ class SAMLoveDA(pl.LightningModule):
         
         # 打印验证结果标题
         print("\n" + "="*60)
-        print(f"验证结果 - Epoch {self.current_epoch+1}")
+        if self.config.get('FOCAL_LOSS', False):
+            print(f"验证结果 - Epoch {self.current_epoch+1} (使用Focal Loss α={self.config.get('FOCAL_ALPHA', 0.25)}, γ={self.config.get('FOCAL_GAMMA', 2.0)})")
+        else:
+            print(f"验证结果 - Epoch {self.current_epoch+1}")
         print("="*60)
         
         # 打印类别指标

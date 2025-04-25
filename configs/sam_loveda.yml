@@ -11,7 +11,7 @@ ACCUMULATE_GRAD_BATCHES: 2  # 通过梯度累积模拟更大的批次大小
 # 模型参数
 SAM_VERSION: 'vit_b'  # 'vit_b', 'vit_l', 'vit_h'
 SAM_CKPT_PATH: 'sam_ckpts/sam_vit_b_01ec64.pth'
-NO_PRETRAIN: true  # 如果预训练权重不存在，设置为true以跳过加载
+NO_PRETRAIN: false  # 如果预训练权重不存在，设置为true以跳过加载
 PATCH_SIZE: 512  # 图像尺寸从1024降低到512以节省GPU内存
 USE_SAM_DECODER: false  # 使用SAM解码器还是简单解码器
 NUM_CLASSES: 8  # 包括背景类
@@ -38,7 +38,10 @@ SPLIT_INFO:
   TEST: 'Test'
 
 # 损失函数
-FOCAL_LOSS: false  # 使用focal loss而不是交叉熵
+FOCAL_LOSS: true  # 启用focal loss来处理类别不平衡
+FOCAL_ALPHA: 0.25  # focal loss alpha参数 - 平衡正负样本
+FOCAL_GAMMA: 2.0   # focal loss gamma参数 - 关注难分样本
+CLASS_WEIGHTS: [0.5, 1.0, 3.0, 2.0, 1.0, 1.0, 1.0, 1.0]  # 类别权重 [背景, 建筑, 道路, 水体, 草地, 森林, 农田, 其他]
 
 # 调试选项
 DEBUG: false  # 启用详细调试日志
