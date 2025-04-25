@@ -280,10 +280,9 @@ class SAMLoveDA(pl.LightningModule):
             alpha = config.get('FOCAL_ALPHA', 0.25)
             gamma = config.get('FOCAL_GAMMA', 2.0)
             logger.info(f"使用Focal Loss - alpha={alpha}, gamma={gamma}")
-            self.mask_criterion = partial(torchvision.ops.sigmoid_focal_loss, 
-                                         alpha=alpha, 
-                                         gamma=gamma, 
-                                         reduction='mean')
+            self.mask_criterion = lambda pred, target: focal_loss(pred, target, self.num_classes, 
+                                                                 alpha=self.config.get('FOCAL_ALPHA', 0.25),
+                                                                 gamma=self.config.get('FOCAL_GAMMA', 2.0))
         else:
             # 检查是否有类别权重
             if config.get('CLASS_WEIGHTS', None) is not None:
