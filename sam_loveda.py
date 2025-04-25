@@ -621,6 +621,24 @@ class SAMLoveDA(pl.LightningModule):
         if batch_idx == 0 and self.current_epoch % 5 == 0:
             self._log_images(batch, mask_logits)
         
+        # 在计算loss后添加
+        if batch_idx == 0 and self.current_epoch > 0:
+            # 检查预测分布
+            softmax_probs = F.softmax(mask_logits, dim=1)
+            class_probs = softmax_probs.mean(dim=[0,2,3])
+            print(f"类别概率分布: {class_probs}")
+            
+            # 检查预测类别分布
+            preds = torch.argmax(mask_logits, dim=1)
+            unique_preds, counts = torch.unique(preds, return_counts=True)
+            print(f"预测类别分布: {unique_preds.tolist()}")
+            print(f"预测类别计数: {counts.tolist()}")
+            
+            # 检查真实标签分布
+            unique_targets, target_counts = torch.unique(masks, return_counts=True)
+            print(f"目标类别分布: {unique_targets.tolist()}")
+            print(f"目标类别计数: {target_counts.tolist()}")
+        
         return total_loss
 
     def validation_step(self, batch, batch_idx):
@@ -689,6 +707,25 @@ class SAMLoveDA(pl.LightningModule):
         # 如果是第一个批次，记录一些预览图像
         if batch_idx == 0:
             self._log_images(batch, mask_logits)
+
+        # 打印实际IoU计算的中间值
+        if batch_idx == 0:
+            preds = torch.argmax(mask_logits, dim=1)
+            target = batch['mask']
+            
+            # 检查预测的分布情况
+            unique_preds, pred_counts = torch.unique(preds, return_counts=True)
+            print(f"验证预测类别: {unique_preds.tolist()}")
+            print(f"验证预测计数: {pred_counts.tolist()}")
+            
+            # 计算一个样本的每个类别IoU
+            for c in range(1, self.num_classes):
+                pred_mask = (preds == c).float()
+                target_mask = (target == c).float()
+                intersection = (pred_mask * target_mask).sum().item()
+                union = (pred_mask + target_mask).clamp(0, 1).sum().item()
+                iou = intersection / (union + 1e-8)
+                print(f"类别{c} 手动计算IoU: {iou:.4f}")
 
         # 返回验证批次指标
         return {'val_loss': loss, 'val_mean_iou': mean_iou, 'class_scores': class_scores}
