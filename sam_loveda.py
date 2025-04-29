@@ -378,27 +378,31 @@ class SAMLoveDA(pl.LightningModule):
 
     def forward(self, batch):
         # 获取输入图像
-        rgb = batch['image']  # [B, C, H, W]
+        rgb = batch['image']
         
-        # 调试信息
-        if logger.level <= logging.DEBUG:
-            print_tensor_info("输入图像", rgb)
-        
-        # 检查RGB图像
-        assert rgb.dim() == 4, f"输入图像维度错误: expected 4D tensor, got {rgb.dim()}D"
-        assert rgb.size(1) == 3, f"输入通道错误: expected 3 channels, got {rgb.size(1)}"
+        # 检查输入范围
+        if torch.isnan(rgb).any():
+            logger.error("输入图像包含NaN")
+        if torch.isinf(rgb).any():
+            logger.error("输入图像包含Inf")
         
         # 归一化图像
         x = (rgb - self.pixel_mean) / self.pixel_std
         
         # 获取图像特征
-        if logger.level <= logging.DEBUG:
-            logger.debug("获取图像特征...")
         image_embeddings = self.image_encoder(x)
-        if logger.level <= logging.DEBUG:
-            print_tensor_info("图像特征", image_embeddings)
         
-        # 使用SAM解码器或自定义解码器生成分割结果
+        # 检查特征
+        if torch.isnan(image_embeddings).any():
+            logger.error("图像特征包含NaN")
+            # 打印最后一个卷积层的统计信息
+            for name, module in self.image_encoder.named_modules():
+                if isinstance(module, nn.Conv2d):
+                    last_conv = module
+            if last_conv is not None:
+                print_tensor_info(f"最后一个卷积层权重", last_conv.weight)
+        
+        # 使用解码器生成分割结果
         if self.config.USE_SAM_DECODER:
             if logger.level <= logging.DEBUG:
                 logger.debug("使用SAM解码器...")
@@ -426,13 +430,10 @@ class SAMLoveDA(pl.LightningModule):
             mask_scores = torch.sigmoid(mask_logits)
         
         # 检查输出
-        assert mask_logits.size(1) == self.num_classes, f"输出类别数错误: expected {self.num_classes}, got {mask_logits.size(1)}"
-        assert mask_logits.size(2) == self.image_size and mask_logits.size(3) == self.image_size, \
-            f"输出尺寸错误: expected {self.image_size}x{self.image_size}, got {mask_logits.size(2)}x{mask_logits.size(3)}"
-        
-        if logger.level <= logging.DEBUG:
-            print_tensor_info("掩码logits", mask_logits)
-            print_tensor_info("掩码scores", mask_scores)
+        if torch.isnan(mask_logits).any():
+            logger.error("掩码logits包含NaN")
+        if torch.isnan(mask_scores).any():
+            logger.error("掩码scores包含NaN")
         
         return mask_logits, mask_scores
 
@@ -470,35 +471,64 @@ class SAMLoveDA(pl.LightningModule):
         return class_pred, mask_scores
 
     def training_step(self, batch, batch_idx):
-        # 调试信息
+        if self.trainer.fast_dev_run:
+            logger.info("Fast dev run mode: training step")
+            print_tensor_info("输入图像", batch['image'])
+            print_tensor_info("输入掩码", batch['mask'])
+
+        # 在前向传播前添加输入检查
         if logger.level <= logging.DEBUG:
-            logger.debug(f"训练步骤 {self.current_epoch}:{batch_idx}")
-            if batch_idx == 0:
-                keys_info = ", ".join(batch.keys())
-                logger.debug(f"批次包含键: {keys_info}")
-        
+            print_tensor_info("输入图像", batch['image'])
+            print_tensor_info("输入掩码", batch['mask'])
+            
+            # 检查掩码值的范围
+            mask_unique = torch.unique(batch['mask'])
+            logger.debug(f"掩码中的唯一值: {mask_unique.tolist()}")
+            if torch.any(mask_unique >= self.num_classes):
+                logger.error(f"掩码包含无效类别: {mask_unique[mask_unique >= self.num_classes].tolist()}")
+
         # 前向传播
         mask_logits, mask_scores = self.forward(batch)
         
-        # 获取目标掩码
-        masks = batch['mask']  # [B, H, W]
-        
-        # 调试信息
-        if logger.level <= logging.DEBUG:
-            print_tensor_info("目标掩码", masks)
+        # 检查输出的数值范围
+        if batch_idx % 100 == 0:
+            print_tensor_info("掩码logits", mask_logits)
+            print_tensor_info("掩码scores", mask_scores)
             
-            # 检查目标掩码是否包含所有类别
-            unique_classes = torch.unique(masks)
-            logger.debug(f"目标掩码中包含类别: {unique_classes.tolist()}")
-        
-        # 计算主损失
+            # 检查是否有梯度爆炸
+            for name, param in self.named_parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.norm().item()
+                    if grad_norm > 10:
+                        logger.warning(f"参数 {name} 的梯度范数过大: {grad_norm}")
+
+        # 获取目标掩码
+        masks = batch['mask']
+
+        # 计算损失前检查数值
         if self.config.get('FOCAL_LOSS', False):
-            # 对于Focal Loss，需要创建one-hot编码
+            # 对于Focal Loss，检查输入范围
             onehot_masks = F.one_hot(masks, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+            if torch.isnan(onehot_masks).any():
+                logger.error("one-hot编码后的掩码包含NaN")
             loss = self.mask_criterion(mask_logits, onehot_masks)
         else:
             loss = self.mask_criterion(mask_logits, masks)
-        
+
+        # 损失值异常检查
+        if torch.isnan(loss) or torch.isinf(loss):
+            logger.error(f"检测到异常损失值: {loss.item()}")
+            logger.error("最近一次的梯度范数:")
+            for name, param in self.named_parameters():
+                if param.grad is not None:
+                    logger.error(f"{name}: {param.grad.norm().item()}")
+            # 可以选择跳过这个批次
+            return None
+
+        # 损失过大检查
+        if loss.item() > self.config.get('LOSS_THRESHOLD', 10.0):
+            logger.warning(f"损失值过大: {loss.item()}")
+
         # 调试
         if torch.isnan(loss) or torch.isinf(loss):
             logger.error(f"NaN or Inf loss detected: {loss}")
@@ -641,6 +671,10 @@ class SAMLoveDA(pl.LightningModule):
         return total_loss
 
     def validation_step(self, batch, batch_idx):
+        if self.trainer.fast_dev_run:
+            logger.info("Fast dev run mode: validation step")
+            print_tensor_info("验证图像", batch['image'])
+
         # 前向传播
         mask_logits, mask_scores = self.forward(batch)
         
@@ -992,34 +1026,41 @@ class SAMLoveDA(pl.LightningModule):
             param_num = sum([int(p.numel()) for p in param_dict['params']])
             print(f'optim param dict {i} params num: {param_num}')
         
-        # 创建优化器
-        optimizer = torch.optim.Adam(param_dicts, lr=self.config.get('BASE_LR', 1e-4))
+        # 添加梯度裁剪
+        for param_dict in param_dicts:
+            param_dict['max_norm'] = self.config.get('GRAD_CLIP', 1.0)
         
-        # 学习率调度器
-        scheduler_type = self.config.get('LR_SCHEDULER', 'step')
+        # 使用AdamW优化器，添加权重衰减
+        optimizer = torch.optim.AdamW(
+            param_dicts,
+            lr=self.config.get('BASE_LR', 1e-4),
+            weight_decay=self.config.get('WEIGHT_DECAY', 0.01)
+        )
         
-        if scheduler_type == 'cosine':
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=self.config.get('TRAIN_EPOCHS', 50),
-                eta_min=self.config.get('MIN_LR', 1e-6)
-            )
-        elif scheduler_type == 'step':
-            scheduler = torch.optim.lr_scheduler.StepLR(
-                optimizer, 
-                step_size=self.config.get('LR_STEP_SIZE', 10), 
-                gamma=self.config.get('LR_GAMMA', 0.1)
-            )
-        elif scheduler_type == 'multistep':
-            scheduler = torch.optim.lr_scheduler.MultiStepLR(
-                optimizer,
-                milestones=self.config.get('LR_MILESTONES', [30, 40]),
-                gamma=self.config.get('LR_GAMMA', 0.1)
-            )
-        else:
-            return optimizer
-            
-        return {'optimizer': optimizer, 'lr_scheduler': scheduler} 
+        # 获取dataloader长度，如果在fast_dev_run模式下使用默认值
+        try:
+            steps_per_epoch = len(self.trainer.train_dataloader)
+        except:
+            steps_per_epoch = 100  # fast_dev_run的默认值
+        
+        # 使用带预热的学习率调度器
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=self.config.get('BASE_LR', 1e-4),
+            epochs=self.config.get('TRAIN_EPOCHS', 50),
+            steps_per_epoch=steps_per_epoch,
+            pct_start=0.1,
+            div_factor=25.0,
+            final_div_factor=1e4
+        )
+        
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step"  # 每个步骤都更新学习率
+            }
+        }
 
     @staticmethod
     def mean_iou(pred, target, n_classes=None):
@@ -1388,6 +1429,110 @@ def create_dummy_config():
     config['MIN_LR'] = 1e-6
     
     return config
+
+class TrainingMonitor(pl.Callback):
+    def __init__(self):
+        super().__init__()
+        self.prev_loss = None
+        self.loss_spike_count = 0
+        self.grad_norm_history = []
+    
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if outputs is None:
+            return
+        
+        current_loss = outputs['loss'].item()
+        
+        # 检查损失突变
+        if self.prev_loss is not None:
+            loss_change = abs(current_loss - self.prev_loss) / (self.prev_loss + 1e-8)
+            if loss_change > 5.0:  # 损失变化超过500%
+                self.loss_spike_count += 1
+                logger.warning(f"检测到损失突变: {self.prev_loss:.4f} -> {current_loss:.4f}")
+                
+                if self.loss_spike_count >= 3:
+                    logger.error("连续检测到多次损失突变，建议检查学习率或梯度裁剪设置")
+            else:
+                self.loss_spike_count = 0
+        
+        self.prev_loss = current_loss
+        
+        # 记录梯度范数
+        total_norm = 0
+        for p in pl_module.parameters():
+            if p.grad is not None:
+                total_norm += p.grad.data.norm(2).item() ** 2
+        total_norm = total_norm ** 0.5
+        self.grad_norm_history.append(total_norm)
+        
+        # 检查梯度异常
+        if len(self.grad_norm_history) > 100:
+            recent_norms = self.grad_norm_history[-100:]
+            avg_norm = sum(recent_norms) / len(recent_norms)
+            if total_norm > 10 * avg_norm:
+                logger.warning(f"检测到梯度范数异常: {total_norm:.4f} (平均: {avg_norm:.4f})")
+    
+    def on_train_epoch_end(self, trainer, pl_module):
+        # 重置监控状态
+        self.prev_loss = None
+        self.loss_spike_count = 0
+        self.grad_norm_history = []
+
+def train_model(model, config):
+    trainer = pl.Trainer(
+        max_epochs=config.TRAIN_EPOCHS,
+        callbacks=[
+            TrainingMonitor(),
+            pl.callbacks.ModelCheckpoint(
+                monitor='val_mean_iou',
+                mode='max',
+                save_top_k=3,
+                filename='{epoch}-{val_mean_iou:.4f}'
+            ),
+            pl.callbacks.EarlyStopping(
+                monitor='val_mean_iou',
+                mode='max',
+                patience=10,
+                min_delta=0.001
+            )
+        ],
+        gradient_clip_val=config.get('GRAD_CLIP', 1.0),
+        gradient_clip_algorithm='norm',
+        fast_dev_run=True  # 启用快速开发运行模式
+    )
+    
+    # 开始训练
+    trainer.fit(model)
+
+    if trainer.fast_dev_run:
+        print("Fast dev run模式下不保存检查点")
+    else:
+        print(f"最佳模型: {checkpoint_callback.best_model_path} (IoU: {checkpoint_callback.best_model_score:.4f})")
+
+def focal_loss(pred, target, num_classes, alpha=0.25, gamma=2.0):
+    """多分类Focal Loss实现
+    
+    Args:
+        pred: 预测logits [B, C, H, W]
+        target: one-hot编码的目标 [B, C, H, W]
+        num_classes: 类别数量
+        alpha: 平衡因子
+        gamma: 聚焦参数
+    """
+    # 使用softmax获取概率
+    pred_softmax = F.softmax(pred, dim=1)
+    
+    # 计算交叉熵
+    ce_loss = F.cross_entropy(pred, target, reduction='none')
+    
+    # 计算focal weight
+    pt = torch.exp(-ce_loss)
+    focal_weight = alpha * (1-pt)**gamma
+    
+    # 计算最终损失
+    loss = (focal_weight * ce_loss).mean()
+    
+    return loss
 
 if __name__ == "__main__":
     # 运行测试代码
