@@ -427,7 +427,7 @@ class SAMLoveDA(pl.LightningModule):
             if logger.level <= logging.DEBUG:
                 logger.debug("使用自定义解码器...")
             mask_logits = self.map_decoder(image_embeddings)
-            mask_scores = torch.sigmoid(mask_logits)
+            mask_scores = F.softmax(mask_logits, dim=1)  # 使用softmax进行多类别分类
         
         # 检查输出
         if torch.isnan(mask_logits).any():
@@ -464,8 +464,8 @@ class SAMLoveDA(pl.LightningModule):
         else:
             mask_logits = self.map_decoder(image_embeddings)
         
-        # 返回类别预测和置信度
-        mask_scores = torch.sigmoid(mask_logits)
+        # 使用softmax而不是sigmoid
+        mask_scores = F.softmax(mask_logits, dim=1)
         class_pred = torch.argmax(mask_logits, dim=1)
         
         return class_pred, mask_scores
