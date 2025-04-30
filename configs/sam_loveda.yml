@@ -39,9 +39,13 @@ SPLIT_INFO:
 
 # 损失函数
 FOCAL_LOSS: true  # 启用focal loss来处理类别不平衡
-FOCAL_ALPHA: 0.25  # focal loss alpha参数 - 平衡正负样本
-FOCAL_GAMMA: 2.0   # focal loss gamma参数 - 关注难分样本
-CLASS_WEIGHTS: [0.5, 1.0, 3.0, 2.0, 1.0, 1.0, 1.0, 1.0]  # 类别权重 [背景, 建筑, 道路, 水体, 草地, 森林, 农田, 其他]
+FOCAL_ALPHA: 0.5  # 增加alpha从0.25到0.5，更强调少数类
+FOCAL_GAMMA: 3.0  # 增加gamma从2.0到3.0，更关注难分样本
+CLASS_WEIGHTS: [0.0, 0.1, 4.0, 4.0, 3.0, 2.0, 2.0, 3.0]  # 类别权重 [无数据(忽略), 背景, 建筑, 道路, 水体, 贫瘠地, 森林, 农田]
+
+# 添加新参数用于类别平衡
+BALANCED_SAMPLING: true  # 启用平衡采样策略
+BACKGROUND_PIXEL_RATE: 0.5  # 限制背景像素在训练中的比例
 
 # 调试选项
 DEBUG: false  # 启用详细调试日志
@@ -53,11 +57,11 @@ LOG_INTERVAL: 50
 SAVE_INTERVAL: 5
 
 # 注释 - 类别映射
-# 0: 背景
-# 1: 建筑
-# 2: 道路
-# 3: 水体
-# 4: 草地
-# 5: 森林
-# 6: 农田
-# 7: 其他
+# 0: 无数据 (忽略)
+# 1: 背景
+# 2: 建筑
+# 3: 道路
+# 4: 水体
+# 5: 贫瘠地
+# 6: 森林
+# 7: 农田

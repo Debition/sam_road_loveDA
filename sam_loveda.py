@@ -507,13 +507,17 @@ class SAMLoveDA(pl.LightningModule):
 
         # 计算损失前检查数值
         if self.config.get('FOCAL_LOSS', False):
-            # 对于Focal Loss，检查输入范围
-            onehot_masks = F.one_hot(masks, num_classes=self.num_classes).permute(0, 3, 1, 2).float()
-            if torch.isnan(onehot_masks).any():
-                logger.error("one-hot编码后的掩码包含NaN")
-            loss = self.mask_criterion(mask_logits, onehot_masks)
+            loss = focal_loss(mask_logits, masks, self.num_classes, 
+                             alpha=self.config.get('FOCAL_ALPHA', 0.5),
+                             gamma=self.config.get('FOCAL_GAMMA', 3.0),
+                             ignore_index=0)  # 确保忽略索引0
         else:
-            loss = self.mask_criterion(mask_logits, masks)
+            # 检查是否有类别权重
+            if self.config.get('CLASS_WEIGHTS', None) is not None:
+                weights = torch.tensor(self.config.CLASS_WEIGHTS, dtype=torch.float, device=self.device)
+                loss = F.cross_entropy(mask_logits, masks, weight=weights, ignore_index=0)
+            else:
+                loss = F.cross_entropy(mask_logits, masks, ignore_index=0)
 
         # 损失值异常检查
         if torch.isnan(loss) or torch.isinf(loss):
@@ -555,13 +559,13 @@ class SAMLoveDA(pl.LightningModule):
         class_losses = []
         
         # 重点关注的类别
-        road_mask = (masks == 2).float()
-        building_mask = (masks == 1).float()
-        water_mask = (masks == 3).float()
+        road_mask = (masks == 3).float()  # 道路索引为3
+        building_mask = (masks == 2).float()  # 建筑索引为2
+        water_mask = (masks == 4).float()  # 水体索引为4
         
-        road_logits = mask_logits[:, 2]
-        building_logits = mask_logits[:, 1]
-        water_logits = mask_logits[:, 3]
+        road_logits = mask_logits[:, 3]  # 获取道路类的logits
+        building_logits = mask_logits[:, 2]  # 获取建筑类的logits
+        water_logits = mask_logits[:, 4]  # 获取水体类的logits
         
         # 使用Focal Loss或BCE
         if self.config.get('FOCAL_LOSS', False):
@@ -681,11 +685,19 @@ class SAMLoveDA(pl.LightningModule):
         # 获取目标掩码
         masks = batch['mask']  # [B, H, W]
         
-        # 计算损失
+        # 计算损失 - 修改这部分以保持一致性
         if self.config.get('FOCAL_LOSS', False):
-            loss = self.mask_criterion(mask_logits, F.one_hot(masks, num_classes=self.num_classes).permute(0, 3, 1, 2).float())
+            loss = focal_loss(mask_logits, masks, self.num_classes, 
+                            alpha=self.config.get('FOCAL_ALPHA', 0.25),
+                            gamma=self.config.get('FOCAL_GAMMA', 2.0),
+                            ignore_index=0)
         else:
-            loss = self.mask_criterion(mask_logits, masks)
+            # 检查是否有类别权重
+            if self.config.get('CLASS_WEIGHTS', None) is not None:
+                weights = torch.tensor(self.config.CLASS_WEIGHTS, dtype=torch.float, device=self.device)
+                loss = F.cross_entropy(mask_logits, masks, weight=weights, ignore_index=0)
+            else:
+                loss = F.cross_entropy(mask_logits, masks, ignore_index=0)
         
         # 获取预测结果
         preds = torch.argmax(mask_logits, dim=1)
@@ -764,9 +776,11 @@ class SAMLoveDA(pl.LightningModule):
         return {'val_loss': loss, 'val_mean_iou': mean_iou, 'class_scores': class_scores}
 
     def on_validation_epoch_end(self):
-        # 类别名称
-        class_names = ["背景", "建筑", "道路", "水体", "草地", "森林", "农田", "其他"]
-        
+        # 修正类别名称
+        class_names = [
+            "无数据", "背景", "建筑", "道路", 
+            "水体", "贫瘠地", "森林", "农田"
+        ]
         # 收集并显示所有类别的IoU
         class_iou_values = []
         class_f1_values = []
@@ -935,17 +949,16 @@ class SAMLoveDA(pl.LightningModule):
         masks = batch['mask'][:max_images]
         preds = torch.argmax(logits[:max_images], dim=1)
         
-        # 创建彩色标签可视化
-        class_names = ["背景", "建筑", "道路", "水体", "草地", "森林", "农田", "其他"]
-        colors = [
-            [0, 0, 0],         # 0: 背景
-            [255, 0, 0],       # 1: 建筑
-            [255, 255, 0],     # 2: 道路
-            [0, 0, 255],       # 3: 水体
-            [159, 129, 183],   # 4: 草地
-            [0, 255, 0],       # 5: 森林
-            [255, 195, 128],   # 6: 农田
-            [128, 128, 128]    # 7: 其他
+        # 修正颜色映射，确保与类别对应
+        color_map = [
+            [0, 0, 0],       # 0: 无数据 (黑色)
+            [128, 128, 128], # 1: 背景 (灰色)
+            [255, 0, 0],     # 2: 建筑 (红色)
+            [255, 255, 0],   # 3: 道路 (黄色)
+            [0, 0, 255],     # 4: 水体 (蓝色)
+            [159, 129, 183], # 5: 贫瘠地 (紫色)
+            [0, 255, 0],     # 6: 森林 (绿色)
+            [255, 195, 128]  # 7: 农田 (橙色)
         ]
         
         # 为Wandb创建可视化表格
@@ -966,7 +979,7 @@ class SAMLoveDA(pl.LightningModule):
             true_color = np.zeros((true_mask.shape[0], true_mask.shape[1], 3), dtype=np.uint8)
             pred_color = np.zeros((pred_mask.shape[0], pred_mask.shape[1], 3), dtype=np.uint8)
             
-            for c, color in enumerate(colors):
+            for c, color in enumerate(color_map):
                 true_color[true_mask == c] = color
                 pred_color[pred_mask == c] = color
             
@@ -1064,15 +1077,8 @@ class SAMLoveDA(pl.LightningModule):
 
     @staticmethod
     def mean_iou(pred, target, n_classes=None):
-        """计算平均IoU (交并比)
-        
-        Args:
-            pred: 预测掩码 [B, H, W]
-            target: 目标掩码 [B, H, W]
-            n_classes: 类别数量，如果为None则自动从pred和target推断
-        
-        Returns:
-            float: 平均IoU
+        """
+        计算平均IoU，忽略无数据区域(索引0)
         """
         # 确保输入为长整型
         pred = pred.long()
@@ -1085,16 +1091,20 @@ class SAMLoveDA(pl.LightningModule):
         pred = pred.float()
         target = target.float()
         
-        # 计算每个类别的IoU
+        # 创建有效掩码，排除无数据区域
+        valid_mask = (target != 0)
+        
+        # 计算每个类别的IoU，跳过无数据类(0)
         ious = []
-        for cls in range(n_classes):
-            pred_inds = pred == cls
-            target_inds = target == cls
+        for i in range(1, n_classes):  # 从1开始，跳过无数据类
+            # 只在有效区域计算
+            pred_inds = (pred == i) & valid_mask
+            target_inds = (target == i) & valid_mask
             
             # 如果该类别在目标中不存在，则跳过
             if target_inds.long().sum() == 0:
                 continue
-                
+            
             # 计算交集和并集
             intersection = (pred_inds & target_inds).float().sum()
             union = (pred_inds | target_inds).float().sum()
@@ -1103,11 +1113,10 @@ class SAMLoveDA(pl.LightningModule):
             if union > 0:
                 ious.append((intersection / union).item())
         
-        # 返回平均IoU
-        if len(ious) > 0:
-            return torch.tensor(sum(ious) / len(ious), device=pred.device)
-        else:
-            return torch.tensor(0.0, device=pred.device)
+        # 计算平均IoU
+        mean_iou = sum(ious) / len(ious) if ious else 0
+        
+        return torch.tensor(mean_iou, device=pred.device)
 
     def _print_param_stats(self):
         """打印模型参数统计信息，包括总参数、加载参数、冻结和可训练参数的数量"""
@@ -1509,30 +1518,73 @@ def train_model(model, config):
     else:
         print(f"最佳模型: {checkpoint_callback.best_model_path} (IoU: {checkpoint_callback.best_model_score:.4f})")
 
-def focal_loss(pred, target, num_classes, alpha=0.25, gamma=2.0):
-    """多分类Focal Loss实现
+def focal_loss(pred, target, num_classes, alpha=0.5, gamma=3.0, ignore_index=0, weight=None):
+    """
+    带忽略索引的Focal Loss实现
     
     Args:
         pred: 预测logits [B, C, H, W]
-        target: one-hot编码的目标 [B, C, H, W]
+        target: 目标掩码 [B, H, W]
         num_classes: 类别数量
         alpha: 平衡因子
         gamma: 聚焦参数
+        ignore_index: 忽略的类别索引
+        weight: 类别权重 [C]
     """
-    # 使用softmax获取概率
+    # 创建掩码来标识有效位置（非忽略位置）
+    valid_mask = (target != ignore_index)
+    
+    # 计算softmax概率
     pred_softmax = F.softmax(pred, dim=1)
     
+    # 防止数值不稳定
+    eps = 1e-6
+    pred_softmax = torch.clamp(pred_softmax, eps, 1.0 - eps)
+    
+    # 创建正确类别的掩码
+    batch_size, _, height, width = pred.shape
+    
+    # 使用F.one_hot进行类别转换，避免直接索引
+    # 先将target中的ignore_index替换为0（临时）
+    target_temp = target.clone()
+    target_temp[~valid_mask] = 0
+    
+    # 转换为one-hot编码 [B, H, W, C]
+    target_one_hot = F.one_hot(target_temp, num_classes).float()
+    
+    # 转换为 [B, C, H, W] 格式
+    target_one_hot = target_one_hot.permute(0, 3, 1, 2)
+    
+    # 将ignore_index对应位置的所有通道权重设为0
+    target_one_hot = target_one_hot * valid_mask.unsqueeze(1).float()
+    
+    # 计算每个像素的pt值（即预测为真实类别的概率）
+    pt = (target_one_hot * pred_softmax).sum(dim=1)
+    
+    # 对于忽略区域，设置pt为1，这样(1-pt)^gamma将为0
+    pt = pt * valid_mask.float() + (1 - valid_mask.float())
+    
+    # 计算focal weight: (1-pt)^gamma
+    focal_weight = (1 - pt) ** gamma
+    
     # 计算交叉熵
-    ce_loss = F.cross_entropy(pred, target, reduction='none')
+    ce = -torch.log(pt + eps)
     
-    # 计算focal weight
-    pt = torch.exp(-ce_loss)
-    focal_weight = alpha * (1-pt)**gamma
+    # 应用类别权重
+    if weight is not None:
+        # 为每个位置分配权重
+        # [C] -> [B, C, H, W]
+        weight_tensor = torch.tensor(weight, device=pred.device)
+        class_weights = target_one_hot * weight_tensor.view(1, -1, 1, 1)
+        pixel_weights = class_weights.sum(dim=1)
+        loss = focal_weight * ce * pixel_weights
+    else:
+        # 不使用权重时，应用固定alpha
+        loss = focal_weight * ce * alpha * valid_mask.float()
     
-    # 计算最终损失
-    loss = (focal_weight * ce_loss).mean()
-    
-    return loss
+    # 对有效像素取平均
+    valid_pixels = valid_mask.float().sum() + eps
+    return loss.sum() / valid_pixels
 
 if __name__ == "__main__":
     # 运行测试代码
