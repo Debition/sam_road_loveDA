@@ -129,27 +129,35 @@ class LoveDATransform:
         )
     
     def __call__(self, img, mask):
+        # 确保输入是连续的数组
+        img = np.ascontiguousarray(img)
+        mask = np.ascontiguousarray(mask)
+        
         # 训练集应用增强
         if self.split == 'train':
             # 随机旋转90度
             if random.random() < 0.5:
                 k = random.randint(1, 3)  # 1, 2, 3 对应90, 180, 270度
-                img = np.rot90(img, k=k, axes=(0, 1))
-                mask = np.rot90(mask, k=k, axes=(0, 1))
+                img = np.ascontiguousarray(np.rot90(img, k=k))
+                mask = np.ascontiguousarray(np.rot90(mask, k=k))
             
             # 随机水平翻转
             if random.random() < 0.5:
-                img = np.fliplr(img)
-                mask = np.fliplr(mask)
+                img = np.ascontiguousarray(np.fliplr(img))
+                mask = np.ascontiguousarray(np.fliplr(mask))
             
             # 随机垂直翻转
             if random.random() < 0.5:
-                img = np.flipud(img)
-                mask = np.flipud(mask)
+                img = np.ascontiguousarray(np.flipud(img))
+                mask = np.ascontiguousarray(np.flipud(mask))
             
             # 颜色抖动
             if random.random() < 0.5:
-                img = self.color_jitter(torch.from_numpy(img.transpose(2, 0, 1))).numpy().transpose(1, 2, 0)
+                img = np.ascontiguousarray(img.transpose(2, 0, 1))  # HWC -> CHW
+                img = torch.from_numpy(img)
+                img = self.color_jitter(img)
+                img = img.numpy()
+                img = np.ascontiguousarray(img.transpose(1, 2, 0))  # CHW -> HWC
         
         return img, mask
 
