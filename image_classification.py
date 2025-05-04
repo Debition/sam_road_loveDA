@@ -183,6 +183,92 @@ def save_results(pred_mask, class_scores, save_dir, filename):
     
     print(f"分类掩码已保存到: {save_dir}")
 
+def threshold_prediction(mask_scores, base_threshold=0.2, high_threshold=0.5, background_class=1):
+    """
+    使用阈值决策而非简单argmax
+    对于各个类别，如果分数超过阈值，则分配该类别
+    如果多个类别超过阈值，取分数最高的类别
+    """
+    h, w = mask_scores.shape[1], mask_scores.shape[2]
+    pred_mask = np.zeros((h, w), dtype=np.uint8)
+    
+    # 设置类别特定阈值
+    thresholds = np.ones(mask_scores.shape[0]) * base_threshold
+    thresholds[background_class] = high_threshold  # 背景类需要更高阈值
+    
+    # 对每个像素位置使用阈值决策
+    for i in range(h):
+        for j in range(w):
+            # 找出超过阈值的类别
+            valid_classes = []
+            for c in range(mask_scores.shape[0]):
+                if mask_scores[c, i, j] > thresholds[c]:
+                    valid_classes.append((c, mask_scores[c, i, j]))
+            
+            # 如果有超过阈值的类别，选择置信度最高的
+            if valid_classes:
+                pred_mask[i, j] = max(valid_classes, key=lambda x: x[1])[0]
+            else:
+                # 如果没有类别超过阈值，默认为背景
+                pred_mask[i, j] = background_class
+    
+    return pred_mask
+
+def modify_class_scores(mask_scores, boost_road=1.5, boost_water=2.0, boost_barren=2.0, boost_forest=1.2):
+    """提升少数类别的分数"""
+    modified_scores = mask_scores.copy()
+    
+    # 增强特定类别的置信度（索引：3=道路，4=水体，5=贫瘠地，6=森林）
+    modified_scores[3] *= boost_road
+    modified_scores[4] *= boost_water
+    modified_scores[5] *= boost_barren
+    modified_scores[6] *= boost_forest
+    
+    return modified_scores
+
+def visualize_score_maps(original_img, pred_mask, class_scores, save_path=None):
+    """可视化所有类别的分数图"""
+    num_classes = class_scores.shape[0]
+    
+    # 计算图表大小 - 原图+预测掩码+所有类别分数图
+    grid_size = int(np.ceil(np.sqrt(num_classes + 2)))
+    
+    # 创建一个更大的图
+    plt.figure(figsize=(grid_size * 4, grid_size * 4))
+    
+    # 原始图像
+    plt.subplot(grid_size, grid_size, 1)
+    plt.title("原始图像")
+    plt.imshow(original_img)
+    plt.axis('off')
+    
+    # 预测掩码（彩色）
+    plt.subplot(grid_size, grid_size, 2)
+    plt.title("预测掩码")
+    color_mask = create_color_mask(pred_mask)
+    plt.imshow(color_mask)
+    plt.axis('off')
+    
+    # 各个类别的分数图
+    for i in range(num_classes):
+        plt.subplot(grid_size, grid_size, i + 3)
+        plt.title(f"类别 {i}: {CLASS_NAMES[i]}")
+        
+        # 使用热力图显示分数
+        plt.imshow(class_scores[i], cmap='hot', vmin=0, vmax=1)
+        plt.colorbar(fraction=0.046, pad=0.04)
+        plt.axis('off')
+    
+    plt.tight_layout()
+    
+    # 保存结果
+    if save_path:
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        plt.savefig(save_path)
+        print(f"分数图可视化已保存到: {save_path}")
+    
+    plt.show()
+
 def main():
     parser = argparse.ArgumentParser(description='土地分类推理程序')
     parser.add_argument('--image', type=str, required=True, help='输入图像路径')
@@ -191,6 +277,13 @@ def main():
     parser.add_argument('--output', type=str, default='results', help='输出目录')
     parser.add_argument('--device', type=str, default='cuda', help='使用设备 (cuda/cpu)')
     parser.add_argument('--bg-class', type=int, default=1, help='背景类的索引 (默认: 1)')
+    parser.add_argument('--boost-road', type=float, default=8, help='道路类别分数提升倍数')
+    parser.add_argument('--boost-water', type=float, default=1, help='水体类别分数提升倍数')
+    parser.add_argument('--boost-barren', type=float, default=1, help='贫瘠地类别分数提升倍数')
+    parser.add_argument('--boost-forest', type=float, default=2, help='森林类别分数提升倍数')
+    parser.add_argument('--use-threshold', action='store_true', help='使用阈值决策代替argmax')
+    parser.add_argument('--base-threshold', type=float, default=0.15, help='基本阈值')
+    parser.add_argument('--bg-threshold', type=float, default=0.3, help='背景类阈值')
     args = parser.parse_args()
     
     # 创建输出目录
@@ -215,11 +308,30 @@ def main():
     
     # 进行预测
     print("执行推理...")
-    pred_mask, class_scores = predict(model, image_tensor, device)
+    _, class_scores = predict(model, image_tensor, device)
+
+    # 增强少数类别分数
+    class_scores = modify_class_scores(
+        class_scores,
+        boost_road=args.boost_road,
+        boost_water=args.boost_water,
+        boost_barren=args.boost_barren,
+        boost_forest=args.boost_forest
+    )
+
+    # 使用阈值法替代argmax
+    pred_mask = threshold_prediction(class_scores, 
+                                    base_threshold=args.base_threshold, 
+                                    high_threshold=args.bg_threshold, 
+                                    background_class=args.bg_class)
     
     # 可视化结果
     save_path = os.path.join(args.output, f"{Path(args.image).stem}_visualization.png")
     visualize_result(original_img, pred_mask, save_path=save_path, background_class=args.bg_class)
+    
+    # 可视化分数图
+    scores_vis_path = os.path.join(args.output, f"{Path(args.image).stem}_score_maps.png")
+    visualize_score_maps(original_img, pred_mask, class_scores, save_path=scores_vis_path)
     
     # 保存结果
     save_results(pred_mask, class_scores, args.output, args.image)

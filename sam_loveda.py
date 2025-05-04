@@ -217,16 +217,27 @@ class SAMLoveDA(pl.LightningModule):
             # Use a simpler decoder (just a few ConvNet layers)
             activation = nn.GELU  # 与SAMRoad保持一致，使用GELU
             self.map_decoder = nn.Sequential(
-                nn.ConvTranspose2d(encoder_output_dim, 256, kernel_size=2, stride=2),
-                LayerNorm2d(256),
+                nn.Conv2d(encoder_output_dim, 256, kernel_size=3, padding=1),
+                nn.BatchNorm2d(256),
                 activation(),
-                nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2),
-                LayerNorm2d(128),
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                
+                nn.Conv2d(256, 128, kernel_size=3, padding=1),
+                nn.BatchNorm2d(128),
                 activation(),
-                nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2),
-                LayerNorm2d(64),
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                
+                nn.Conv2d(128, 64, kernel_size=3, padding=1),
+                nn.BatchNorm2d(64),
                 activation(),
-                nn.ConvTranspose2d(64, self.num_classes, kernel_size=2, stride=2),
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                
+                nn.Conv2d(64, 32, kernel_size=3, padding=1),
+                nn.BatchNorm2d(32),
+                activation(),
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                
+                nn.Conv2d(32, self.num_classes, kernel_size=1)
             )
 
         #### LORA微调
@@ -507,14 +518,18 @@ class SAMLoveDA(pl.LightningModule):
 
         # 计算损失前检查数值
         if self.config.get('FOCAL_LOSS', False):
+            # 获取类别权重
+            weights = torch.tensor(self.config.CLASS_WEIGHTS, dtype=torch.float, device=self.device)
             loss = focal_loss(mask_logits, masks, self.num_classes, 
                              alpha=self.config.get('FOCAL_ALPHA', 0.5),
                              gamma=self.config.get('FOCAL_GAMMA', 3.0),
+                             weights=weights,  # 添加类别权重
                              ignore_index=0)  # 确保忽略索引0
         else:
             # 检查是否有类别权重
             if self.config.get('CLASS_WEIGHTS', None) is not None:
                 weights = torch.tensor(self.config.CLASS_WEIGHTS, dtype=torch.float, device=self.device)
+                # 使用加权交叉熵损失
                 loss = F.cross_entropy(mask_logits, masks, weight=weights, ignore_index=0)
             else:
                 loss = F.cross_entropy(mask_logits, masks, ignore_index=0)
@@ -1518,7 +1533,7 @@ def train_model(model, config):
     else:
         print(f"最佳模型: {checkpoint_callback.best_model_path} (IoU: {checkpoint_callback.best_model_score:.4f})")
 
-def focal_loss(pred, target, num_classes, alpha=0.5, gamma=3.0, ignore_index=0, weight=None):
+def focal_loss(pred, target, num_classes, alpha=0.5, gamma=3.0, ignore_index=0, weights=None):
     """
     带忽略索引的Focal Loss实现
     
@@ -1529,7 +1544,7 @@ def focal_loss(pred, target, num_classes, alpha=0.5, gamma=3.0, ignore_index=0, 
         alpha: 平衡因子
         gamma: 聚焦参数
         ignore_index: 忽略的类别索引
-        weight: 类别权重 [C]
+        weights: 类别权重 [C]
     """
     # 创建掩码来标识有效位置（非忽略位置）
     valid_mask = (target != ignore_index)
@@ -1571,20 +1586,22 @@ def focal_loss(pred, target, num_classes, alpha=0.5, gamma=3.0, ignore_index=0, 
     ce = -torch.log(pt + eps)
     
     # 应用类别权重
-    if weight is not None:
+    if weights is not None:
         # 为每个位置分配权重
         # [C] -> [B, C, H, W]
-        weight_tensor = torch.tensor(weight, device=pred.device)
-        class_weights = target_one_hot * weight_tensor.view(1, -1, 1, 1)
+        weight_tensor = weights.view(1, -1, 1, 1)
+        class_weights = target_one_hot * weight_tensor
         pixel_weights = class_weights.sum(dim=1)
         loss = focal_weight * ce * pixel_weights
     else:
         # 不使用权重时，应用固定alpha
-        loss = focal_weight * ce * alpha * valid_mask.float()
+        loss = focal_weight * ce * alpha
     
-    # 对有效像素取平均
-    valid_pixels = valid_mask.float().sum() + eps
-    return loss.sum() / valid_pixels
+    # 只对有效位置计算损失
+    loss = loss * valid_mask.float()
+    
+    # 计算平均损失
+    return loss.sum() / (valid_mask.sum() + eps)
 
 if __name__ == "__main__":
     # 运行测试代码

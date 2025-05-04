@@ -7,6 +7,8 @@ import glob
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from collections import Counter
+import random
+import torchvision.transforms.functional as F
 
 class LoveDADataset(Dataset):
     """
@@ -100,79 +102,56 @@ class LoveDADataset(Dataset):
             # 调整掩码大小 - 使用最近邻插值以保持类别标签的整数性质
             mask = cv2.resize(mask, (self.patch_size, self.patch_size), interpolation=cv2.INTER_NEAREST)
         
-        # 创建道路掩码（类别3）
-        road_mask = (mask == 3).astype(np.uint8) * 255
-        
-        # 创建建筑掩码（类别2）
-        building_mask = (mask == 2).astype(np.uint8) * 255
-        
-        # 创建水体掩码（类别4）
-        water_mask = (mask == 4).astype(np.uint8) * 255
-        
-        # 应用变换（如果有）
+        # 应用数据增强
         if self.transform:
-            img, mask, road_mask, building_mask, water_mask = self.transform(
-                img, mask, road_mask, building_mask, water_mask)
+            img, mask = self.transform(img, mask)
         
         # 转换为PyTorch张量
         img = torch.from_numpy(img.transpose(2, 0, 1)).float() / 255.0
         mask = torch.from_numpy(mask).long()
-        road_mask = torch.from_numpy(road_mask).float() / 255.0
-        building_mask = torch.from_numpy(building_mask).float() / 255.0
-        water_mask = torch.from_numpy(water_mask).float() / 255.0
         
         return {
             'image': img,
             'mask': mask,
-            'road_mask': road_mask,
-            'building_mask': building_mask,
-            'water_mask': water_mask,
             'sample_id': sample_id,
-            'region': region,
-            'img_path': img_path,
-            'mask_path': mask_path
+            'region': region
         }
 
-    def get_class_distribution(self):
-        """计算数据集的类别分布"""
-        print(f"计算 {self.split} 集的类别分布...")
-        class_counts = Counter()
-        class_pixels = Counter()
-        total_pixels = 0
-        
-        for mask_path in self.mask_paths:
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-            # 统计像素分布
-            unique_values, counts = np.unique(mask, return_counts=True)
-            for val, count in zip(unique_values, counts):
-                class_pixels[int(val)] += count
-                total_pixels += count
-            # 统计样本中出现的类别
-            for val in unique_values:
-                class_counts[int(val)] += 1
-        
-        class_names = ["忽略区域", "背景", "建筑", "道路", "水体", "荒地", "森林", "农田"]
-        
-        print(f"\n{self.split} 集的类别分布:")
-        print(f"{'类别ID':<10}{'类别名称':<10}{'出现样本数':<15}{'占比(%)':<10}{'像素数':<15}{'像素占比(%)':<15}")
-        print('-' * 75)
-        
-        for class_id in sorted(class_counts.keys()):
-            if class_id < len(class_names):
-                class_name = class_names[class_id]
-            else:
-                class_name = f"未知({class_id})"
+class LoveDATransform:
+    """LoveDA数据集的数据增强类"""
+    def __init__(self, split='train'):
+        self.split = split
+        self.color_jitter = torchvision.transforms.ColorJitter(
+            brightness=0.2,
+            contrast=0.2,
+            saturation=0.2,
+            hue=0.1
+        )
+    
+    def __call__(self, img, mask):
+        # 训练集应用增强
+        if self.split == 'train':
+            # 随机旋转90度
+            if random.random() < 0.5:
+                k = random.randint(1, 3)  # 1, 2, 3 对应90, 180, 270度
+                img = np.rot90(img, k=k, axes=(0, 1))
+                mask = np.rot90(mask, k=k, axes=(0, 1))
             
-            sample_count = class_counts[class_id]
-            sample_percent = sample_count / len(self.mask_paths) * 100
-            pixel_count = class_pixels[class_id]
-            pixel_percent = pixel_count / total_pixels * 100
+            # 随机水平翻转
+            if random.random() < 0.5:
+                img = np.fliplr(img)
+                mask = np.fliplr(mask)
             
-            print(f"{class_id:<10}{class_name:<10}{sample_count:<15}{sample_percent:.2f}%{pixel_count:<15}{pixel_percent:.2f}%")
+            # 随机垂直翻转
+            if random.random() < 0.5:
+                img = np.flipud(img)
+                mask = np.flipud(mask)
+            
+            # 颜色抖动
+            if random.random() < 0.5:
+                img = self.color_jitter(torch.from_numpy(img.transpose(2, 0, 1))).numpy().transpose(1, 2, 0)
         
-        print('-' * 75)
-        return class_counts, class_pixels
-
+        return img, mask
 
 def create_loveda_dataloaders(config):
     """
@@ -189,13 +168,18 @@ def create_loveda_dataloaders(config):
     val_batch_size = config.get('VAL_BATCH_SIZE', batch_size)
     num_workers = config.get('NUM_WORKERS', 4) 
     regions = config.get('REGIONS', ['Urban', 'Rural'])
-    patch_size = config.get('PATCH_SIZE', 1024)  # 获取图像尺寸
+    patch_size = config.get('PATCH_SIZE', 1024)
     
     # 从config中获取分割信息或使用默认值
     split_info = config.get('SPLIT_INFO', {})
     train_split = split_info.get('TRAIN', 'train')
     val_split = split_info.get('VAL', 'val')
     test_split = split_info.get('TEST', 'test')
+    
+    # 创建数据增强
+    train_transform = LoveDATransform(split='train')
+    val_transform = LoveDATransform(split='val')
+    test_transform = LoveDATransform(split='test')
     
     # 打印找到的数据路径信息(调试用)
     print(f"\n{'-'*20} 数据集信息 {'-'*20}")
@@ -204,9 +188,9 @@ def create_loveda_dataloaders(config):
     print(f"图像尺寸: {patch_size}x{patch_size}")
     print(f"训练分割: {train_split}, 验证分割: {val_split}, 测试分割: {test_split}")
     
-    train_dataset = LoveDADataset(root_dir, split=train_split, regions=regions, patch_size=patch_size)
-    val_dataset = LoveDADataset(root_dir, split=val_split, regions=regions, patch_size=patch_size)
-    test_dataset = LoveDADataset(root_dir, split=test_split, regions=regions, patch_size=patch_size)
+    train_dataset = LoveDADataset(root_dir, split=train_split, regions=regions, transform=train_transform, patch_size=patch_size)
+    val_dataset = LoveDADataset(root_dir, split=val_split, regions=regions, transform=val_transform, patch_size=patch_size)
+    test_dataset = LoveDADataset(root_dir, split=test_split, regions=regions, transform=test_transform, patch_size=patch_size)
     
     print(f"\n训练集样本数: {len(train_dataset)}")
     print(f"验证集样本数: {len(val_dataset)}")
@@ -257,9 +241,6 @@ def visualize_sample(sample):
     """
     img = sample['image'].permute(1, 2, 0).numpy()
     mask = sample['mask'].numpy()
-    road_mask = sample['road_mask'].numpy()
-    building_mask = sample['building_mask'].numpy()
-    water_mask = sample['water_mask'].numpy()
     
     # 创建颜色标签可视化
     colors = [
@@ -277,33 +258,13 @@ def visualize_sample(sample):
     for i, color in enumerate(colors):
         colored_mask[mask == i] = color
     
-    fig, axs = plt.subplots(2, 3, figsize=(15, 10))
+    fig, axs = plt.subplots(1, 2, figsize=(10, 5))
     
-    axs[0, 0].imshow(img)
-    axs[0, 0].set_title(f"原始图像 - {sample['region']} - {sample['sample_id']}")
+    axs[0].imshow(img)
+    axs[0].set_title(f"原始图像 - {sample['region']} - {sample['sample_id']}")
     
-    axs[0, 1].imshow(colored_mask)
-    axs[0, 1].set_title('分类掩码')
-    
-    axs[0, 2].imshow(road_mask, cmap='gray')
-    axs[0, 2].set_title('道路掩码')
-    
-    axs[1, 0].imshow(building_mask, cmap='gray')
-    axs[1, 0].set_title('建筑掩码')
-    
-    axs[1, 1].imshow(water_mask, cmap='gray')
-    axs[1, 1].set_title('水体掩码')
-    
-    # 打印类别统计
-    class_stats = []
-    for i, name in enumerate(["忽略区域", "背景", "建筑", "道路", "水体", "荒地", "森林", "农田"]):
-        pixels = np.sum(mask == i)
-        percent = pixels / mask.size * 100
-        class_stats.append(f"{name}: {pixels} ({percent:.1f}%)")
-    
-    axs[1, 2].axis('off')
-    axs[1, 2].text(0, 0.5, '\n'.join(class_stats), fontsize=10)
-    axs[1, 2].set_title('类别统计')
+    axs[1].imshow(colored_mask)
+    axs[1].set_title('分类掩码')
     
     plt.tight_layout()
     plt.show()
