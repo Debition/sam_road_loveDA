@@ -8,8 +8,8 @@ from datetime import timedelta
 import os
 
 from utils import load_config
-from loveda_dataset import create_loveda_dataloaders
-from sam_loveda import SAMLoveDA
+from datasets.aisd_dataset import create_aisd_dataloaders
+from sam_aisd import SAMAISD
 
 import wandb
 
@@ -23,7 +23,7 @@ from lightning.pytorch.callbacks.early_stopping import EarlyStopping
 parser = ArgumentParser()
 parser.add_argument(
     "--config",
-    default=None,
+    default="configs/sam_aisd.yml",
     help="config file (.yml) containing the hyper-parameters for training. "
     "If None, use the default config. See /config for examples.",
 )
@@ -51,7 +51,7 @@ if __name__ == "__main__":
     
     # 打印训练配置摘要
     print("\n" + "="*50)
-    print("SAM-LoveDA 训练开始")
+    print("SAM-AISD 训练开始")
     print("="*50)
     print(f"配置文件: {args.config}")
     print(f"模型版本: {config.SAM_VERSION}")
@@ -62,8 +62,7 @@ if __name__ == "__main__":
     print(f"使用SAM解码器: {config.USE_SAM_DECODER}")
     print(f"使用LoRA: {config.ENCODER_LORA} (秩: {config.LORA_RANK})")
     print(f"冻结编码器: {config.FREEZE_ENCODER}")
-    print(f"数据集: {config.DATASET_ROOT} (区域: {config.REGIONS})")
-    print(f"精度: {args.precision}")
+    print(f"城市数量: {len(config.CITY_MEANS)}")
     print(f"开发模式: {dev_run}")
     print("="*50 + "\n")
 
@@ -82,23 +81,21 @@ if __name__ == "__main__":
     # start a new wandb run to track this script
     wandb.init(
         # set the wandb project where this run will be logged
-        project="sam_loveda",
+        project="sam_aisd",
         # track hyperparameters and run metadata
         config=config,
         # disable wandb if debugging
         mode='disabled' if dev_run else None
     )
 
-
     # Good when model architecture/input shape are fixed.
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
     
+    net = SAMAISD(config)
 
-    net = SAMLoveDA(config)
-
-    # 使用新的create_loveda_dataloaders函数创建数据加载器
-    train_loader, val_loader, _ = create_loveda_dataloaders(config)
+    # 使用新的create_aisd_dataloaders函数创建数据加载器
+    train_loader, val_loader, test_loader = create_aisd_dataloaders(config)
 
     if dev_run:
         # 限制数据集大小用于快速测试
@@ -126,7 +123,7 @@ if __name__ == "__main__":
         )
 
     # 创建输出目录
-    checkpoint_dir = config.get('CHECKPOINT_DIR', 'checkpoints/sam_loveda')
+    checkpoint_dir = config.CHECKPOINT_DIR if hasattr(config, 'CHECKPOINT_DIR') else 'checkpoints/sam_aisd'
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     # 设置回调
@@ -155,7 +152,7 @@ if __name__ == "__main__":
     if not dev_run:
         early_stop_callback = EarlyStopping(
             monitor='val_mean_iou',
-            patience=10,
+            patience=config.EARLY_STOPPING_PATIENCE if hasattr(config, 'EARLY_STOPPING_PATIENCE') else 10,
             verbose=True,
             mode='max'
         )
@@ -166,17 +163,18 @@ if __name__ == "__main__":
 
     print(f"数据加载完成 - 训练集: {len(train_loader.dataset)}个样本, 批次数: {len(train_loader)}")
     print(f"           - 验证集: {len(val_loader.dataset)}个样本, 批次数: {len(val_loader)}")
+    print(f"           - 测试集: {len(test_loader.dataset)}个样本, 批次数: {len(test_loader)}")
     print(f"开始训练过程...\n")
 
     trainer = pl.Trainer(
         max_epochs=config.TRAIN_EPOCHS,
-        check_val_every_n_epoch=1,
+        check_val_every_n_epoch=config.VAL_INTERVAL if hasattr(config, 'VAL_INTERVAL') else 1,
         num_sanity_val_steps=2,
         callbacks=callbacks,
         logger=wandb_logger,
         fast_dev_run=args.fast_dev_run,
         precision=args.precision,
-        log_every_n_steps=config.get('LOG_INTERVAL', 50),
+        log_every_n_steps=config.LOG_INTERVAL if hasattr(config, 'LOG_INTERVAL') else 50,
         )
 
     try:
@@ -199,5 +197,3 @@ if __name__ == "__main__":
         print("\n训练被用户中断!")
         elapsed_time = time.time() - start_time
         print(f"已训练时间: {timedelta(seconds=int(elapsed_time))}")
-        if os.path.exists(os.path.join(checkpoint_dir, 'last.ckpt')):
-            print(f"可以从最后检查点恢复: {os.path.join(checkpoint_dir, 'last.ckpt')}")

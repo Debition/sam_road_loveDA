@@ -1,12 +1,12 @@
 # 示例LoveDA数据集配置文件 - 用于首次运行
 
 # 训练参数
-TRAIN_EPOCHS: 10
-TRAIN_BATCH_SIZE: 16  # 将批次大小从4降低到2以减少GPU内存使用
+TRAIN_EPOCHS: 50  # 适当增加训练轮数
+TRAIN_BATCH_SIZE: 8  # 减小批次大小以适应更复杂的模型
 VAL_BATCH_SIZE: 4
 NUM_WORKERS: 4
 SEED: 42
-ACCUMULATE_GRAD_BATCHES: 2  # 通过梯度累积模拟更大的批次大小
+ACCUMULATE_GRAD_BATCHES: 4  # 使用梯度累积来模拟更大的批次
 
 # 模型参数
 SAM_VERSION: 'vit_b'  # 'vit_b', 'vit_l', 'vit_h'
@@ -17,11 +17,12 @@ USE_SAM_DECODER: false  # 使用SAM解码器还是简单解码器
 NUM_CLASSES: 8  # 包括背景类
 
 # 优化器参数
-BASE_LR: 0.0005
+BASE_LR: 0.0002
 WEIGHT_DECAY: 0.01
-LR_SCHEDULER: 'cosine'  # 'cosine', 'step', 'multistep'
-MIN_LR: 0.000001
+LR_SCHEDULER: 'cosine'  # 使用余弦退火
+MIN_LR: 0.00001
 LR_WARMUP: true
+WARMUP_EPOCHS: 5
 
 # 微调策略
 ENCODER_LORA: true  # 使用LoRA微调编码器
@@ -30,7 +31,7 @@ FREEZE_ENCODER: false  # 不使用LoRA时是否冻结编码器
 ENCODER_LR_FACTOR: 0.05  # 编码器学习率系数
 
 # 数据集参数
-DATASET_ROOT: 'dataset'
+DATASET_ROOT: 'dataset'  # 数据集根目录
 REGIONS: ['Urban', 'Rural']  # 要使用的区域
 SPLIT_INFO: 
   TRAIN: 'Train'
@@ -38,23 +39,30 @@ SPLIT_INFO:
   TEST: 'Test'
 
 # 损失函数
-FOCAL_LOSS: true  # 启用focal loss来处理类别不平衡
-FOCAL_ALPHA: 0.7  # 增加alpha以更强调少数类
-FOCAL_GAMMA: 5.0  # 增加gamma以更关注难分样本
-CLASS_WEIGHTS: [0.0, 0.7, 3.0, 3.0, 2.0, 2.0, 3.0, 2.0]  # 类别权重 [无数据(忽略), 背景, 建筑, 道路, 水体, 贫瘠地, 森林, 农田]
+FOCAL_LOSS: true
+FOCAL_ALPHA: 0.7
+FOCAL_GAMMA: 2.0
+# 类别权重 [无数据(忽略), 背景, 建筑, 道路, 水体, 贫瘠地, 森林, 农田]
+CLASS_WEIGHTS: [0.0, 0.2, 1.5, 2.5, 2.5, 2.0, 2.0, 0.5]
 
-# 添加新参数用于类别平衡
-BALANCED_SAMPLING: true  # 启用平衡采样策略
-BACKGROUND_PIXEL_RATE: 0.3  # 限制背景像素在训练中的比例
+# 基础损失组合
+DICE_LOSS_WEIGHT: 0.5  # 添加Dice Loss
+BCE_LOSS_WEIGHT: 0.3   # 添加BCE Loss
+
+# 正则化
+DROPOUT: 0.1
+
+# 训练技巧
+USE_AMP: true  # 使用混合精度训练
+GRAD_CLIP: 1.0  # 梯度裁剪
 
 # 调试选项
-DEBUG: false  # 启用详细调试日志
-DEBUG_SAMPLE_VIZ: false  # 可视化样本图像
-BENCHMARK: false  # 性能基准测试
+DEBUG: false
+SAVE_INTERVAL: 5
+VAL_INTERVAL: 1  # 每轮都进行验证
 
 # 日志记录
 LOG_INTERVAL: 50
-SAVE_INTERVAL: 5
 
 # 注释 - 类别映射
 # 0: 无数据 (忽略)

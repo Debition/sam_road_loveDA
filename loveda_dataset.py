@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 from collections import Counter
 import random
 import torchvision.transforms.functional as F
+import torchvision.transforms as transforms
 
 class LoveDADataset(Dataset):
     """
@@ -114,19 +115,112 @@ class LoveDADataset(Dataset):
             'image': img,
             'mask': mask,
             'sample_id': sample_id,
-            'region': region
+            'region': region,
+            'img_path': img_path,
+            'mask_path': mask_path
         }
+
+    def get_class_distribution(self):
+        """统计数据集中各个类别的分布情况"""
+        print("\n==================== 类别分布 ====================")
+        
+        # 初始化类别计数器
+        class_counts = np.zeros(8, dtype=np.int64)
+        total_pixels = 0
+        
+        # 遍历所有掩码文件
+        for mask_path in self.mask_paths:
+            # 读取掩码
+            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            if mask is None:
+                print(f"警告: 无法读取掩码文件: {mask_path}")
+                continue
+            
+            # 调整大小
+            if mask.shape[0] != self.patch_size:
+                mask = cv2.resize(mask, (self.patch_size, self.patch_size), 
+                                interpolation=cv2.INTER_NEAREST)
+            
+            # 统计每个类别的像素数
+            for i in range(8):
+                class_counts[i] += np.sum(mask == i)
+            
+            total_pixels += mask.size
+        
+        # 打印统计信息
+        print(f"总像素数: {total_pixels}")
+        print(f"类别         像素数             百分比       ")
+        print("-" * 40)
+        
+        for i in range(8):
+            percentage = (class_counts[i] / total_pixels) * 100
+            print(f"{i:<12}{class_counts[i]:<18}{percentage:.2f}%")
+        
+        print("=" * 50)
+        
+        return class_counts, total_pixels
 
 class LoveDATransform:
     """LoveDA数据集的数据增强类"""
-    def __init__(self, split='train'):
+    def __init__(self, split='train', config=None):
         self.split = split
-        self.color_jitter = torchvision.transforms.ColorJitter(
-            brightness=0.2,
-            contrast=0.2,
-            saturation=0.2,
-            hue=0.1
+        self.config = config if config is not None else {}
+        
+        # 基础颜色增强
+        self.color_jitter = transforms.ColorJitter(
+            brightness=0.3,
+            contrast=0.3,
+            saturation=0.3,
+            hue=0.15
         )
+        # 高斯模糊
+        self.gaussian_blur = transforms.GaussianBlur(
+            kernel_size=3, sigma=(0.1, 2.0)
+        )
+        # 随机擦除
+        self.random_erasing = transforms.RandomErasing(
+            p=self.config.get('RANDOM_ERASE_PROB', 0.25),
+            scale=(0.02, 0.33),
+            ratio=(0.3, 3.3),
+            value=0
+        )
+    
+    def cutmix(self, img1, mask1, img2, mask2):
+        """实现CutMix数据增强"""
+        h, w = img1.shape[:2]
+        # 随机生成裁剪框
+        lam = np.random.beta(1.0, 1.0)
+        cut_rat = np.sqrt(1. - lam)
+        cut_w = int(w * cut_rat)
+        cut_h = int(h * cut_rat)
+        
+        # 随机选择裁剪位置
+        cx = np.random.randint(w)
+        cy = np.random.randint(h)
+        
+        # 确定裁剪区域
+        bbx1 = np.clip(cx - cut_w // 2, 0, w)
+        bby1 = np.clip(cy - cut_h // 2, 0, h)
+        bbx2 = np.clip(cx + cut_w // 2, 0, w)
+        bby2 = np.clip(cy + cut_h // 2, 0, h)
+        
+        # 混合图像和掩码
+        img_mixed = img1.copy()
+        mask_mixed = mask1.copy()
+        img_mixed[bby1:bby2, bbx1:bbx2] = img2[bby1:bby2, bbx1:bbx2]
+        mask_mixed[bby1:bby2, bbx1:bbx2] = mask2[bby1:bby2, bbx1:bbx2]
+        
+        return img_mixed, mask_mixed
+    
+    def mixup(self, img1, mask1, img2, mask2, alpha=1.0):
+        """实现Mixup数据增强"""
+        # 生成混合权重
+        lam = np.random.beta(alpha, alpha)
+        # 混合图像
+        img_mixed = lam * img1 + (1 - lam) * img2
+        # 对于掩码，我们使用argmax而不是直接混合
+        mask_mixed = np.where(np.random.rand(*mask1.shape) < lam, mask1, mask2)
+        return img_mixed.astype(np.uint8), mask_mixed
     
     def __call__(self, img, mask):
         # 确保输入是连续的数组
@@ -135,29 +229,64 @@ class LoveDATransform:
         
         # 训练集应用增强
         if self.split == 'train':
-            # 随机旋转90度
+            # 基础几何变换
             if random.random() < 0.5:
-                k = random.randint(1, 3)  # 1, 2, 3 对应90, 180, 270度
+                k = random.randint(1, 3)
                 img = np.ascontiguousarray(np.rot90(img, k=k))
                 mask = np.ascontiguousarray(np.rot90(mask, k=k))
             
-            # 随机水平翻转
             if random.random() < 0.5:
                 img = np.ascontiguousarray(np.fliplr(img))
                 mask = np.ascontiguousarray(np.fliplr(mask))
             
-            # 随机垂直翻转
             if random.random() < 0.5:
                 img = np.ascontiguousarray(np.flipud(img))
                 mask = np.ascontiguousarray(np.flipud(mask))
             
-            # 颜色抖动
+            # 随机缩放和裁剪
             if random.random() < 0.5:
-                img = np.ascontiguousarray(img.transpose(2, 0, 1))  # HWC -> CHW
+                scale = random.uniform(0.8, 1.2)
+                h, w = img.shape[:2]
+                new_h, new_w = int(h * scale), int(w * scale)
+                
+                img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+                mask = cv2.resize(mask, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+                
+                if scale > 1:
+                    start_h = random.randint(0, new_h - h)
+                    start_w = random.randint(0, new_w - w)
+                    img = img[start_h:start_h+h, start_w:start_w+w]
+                    mask = mask[start_h:start_h+h, start_w:start_w+w]
+                elif scale < 1:
+                    pad_h = (h - new_h) // 2
+                    pad_w = (w - new_w) // 2
+                    img = np.pad(img, ((pad_h, h-new_h-pad_h), (pad_w, w-new_w-pad_w), (0, 0)), mode='reflect')
+                    mask = np.pad(mask, ((pad_h, h-new_h-pad_h), (pad_w, w-new_w-pad_w)), mode='constant', constant_values=0)
+            
+            # 颜色增强
+            if random.random() < 0.8:
+                img = np.ascontiguousarray(img.transpose(2, 0, 1))
                 img = torch.from_numpy(img)
                 img = self.color_jitter(img)
+                
+                if random.random() < 0.3:
+                    img = self.gaussian_blur(img)
+                
+                if random.random() < self.config.get('RANDOM_ERASE_PROB', 0.25):
+                    img = self.random_erasing(img)
+                
                 img = img.numpy()
-                img = np.ascontiguousarray(img.transpose(1, 2, 0))  # CHW -> HWC
+                img = np.ascontiguousarray(img.transpose(1, 2, 0))
+            
+            # 随机调整对比度
+            if random.random() < 0.3:
+                alpha = random.uniform(0.8, 1.2)
+                img = np.clip(alpha * img, 0, 255).astype(np.uint8)
+            
+            # 随机调整亮度
+            if random.random() < 0.3:
+                beta = random.uniform(-30, 30)
+                img = np.clip(img + beta, 0, 255).astype(np.uint8)
         
         return img, mask
 

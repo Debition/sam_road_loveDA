@@ -6,6 +6,7 @@ sam_ckpts/
 training_data/
 dataset/
 results/
+save/
 
 # 排除模型权重文件
 *.pth

@@ -1,0 +1,80 @@
+# 训练参数
+TRAIN_EPOCHS: 50
+TRAIN_BATCH_SIZE: 8
+VAL_BATCH_SIZE: 8
+NUM_WORKERS: 4
+SEED: 42
+ACCUMULATE_GRAD_BATCHES: 4  # 使用梯度累积来模拟更大的批次
+
+# 数据集配置
+DATASET_ROOT: 'F:/AISD'
+NUM_CLASSES: 3
+CLASS_NAMES: ['background', 'building', 'road']
+CLASS_COLORS: [[255, 255, 255], [255, 0, 0], [0, 0, 255]]
+TRAIN_SPLIT: 0.8  # 每个城市80%用于训练
+
+# 城市RGB均值
+CITY_MEANS:
+  berlin: [79.94162, 84.72064, 78.94711]
+  chicago: [86.46459, 85.73488, 77.14777]
+  paris: [82.46727, 92.82243, 88.05664]
+  potsdam: [74.85480, 77.37761, 70.22035]
+  tokyo: [96.96883, 98.44344, 108.60135]
+  zurich: [62.36962, 66.11001, 60.32863]
+
+# 模型配置
+SAM_VERSION: 'vit_b'  # 'vit_b', 'vit_l', 'vit_h'
+SAM_CKPT_PATH: 'sam_ckpts/sam_vit_b_01ec64.pth'
+NO_PRETRAIN: false  # 如果预训练权重不存在，设置为true以跳过加载
+PATCH_SIZE: 1024
+USE_SAM_DECODER: false
+ENCODER_LORA: true
+LORA_RANK: 4
+FREEZE_ENCODER: false
+
+# 优化器参数
+BASE_LR: 0.0002
+WEIGHT_DECAY: 0.01
+LR_SCHEDULER: 'cosine'  # 使用余弦退火
+MIN_LR: 0.00001
+LR_WARMUP: true
+WARMUP_EPOCHS: 5
+
+# 微调策略
+ENCODER_LR_FACTOR: 0.05  # 编码器学习率系数
+
+# 损失函数配置
+FOCAL_LOSS: true
+FOCAL_ALPHA: 0.7
+FOCAL_GAMMA: 2.0
+DICE_LOSS_WEIGHT: 0.5  # 添加Dice Loss
+BCE_LOSS_WEIGHT: 0.3   # 添加BCE Loss
+CLASS_WEIGHTS: [0.5, 1.0, 1.0]  # [背景, 建筑物, 道路]
+
+# 数据增强配置
+RANDOM_CROP: true
+CROP_SIZE: 1024
+RANDOM_ROTATE: true
+RANDOM_SCALE: [0.8, 1.2]
+RANDOM_FLIP: true
+COLOR_JITTER: true
+
+# 正则化
+DROPOUT: 0.1
+
+# 训练技巧
+USE_AMP: true  # 使用混合精度训练
+GRAD_CLIP: 1.0  # 梯度裁剪
+
+# 调试选项
+DEBUG: false
+SAVE_INTERVAL: 5
+VAL_INTERVAL: 1  # 每轮都进行验证
+
+# 日志记录
+LOG_INTERVAL: 50
+
+# 注释 - 类别映射
+# 0: 背景
+# 1: 建筑物
+# 2: 道路

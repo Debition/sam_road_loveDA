@@ -125,7 +125,7 @@ class SAMLoveDA(pl.LightningModule):
             # 如果是SimpleNamespace对象，添加get方法
             config.get = lambda key, default=None: getattr(config, key, default)
         
-        logger.info(f"初始化SAMLoveDA模型，配置: {config}")
+        logger.info(f"初始化SAM模型，配置: {config}")
 
         assert config.SAM_VERSION in {'vit_b', 'vit_l', 'vit_h'}, f"不支持的SAM版本: {config.SAM_VERSION}"
         if config.SAM_VERSION == 'vit_b':
@@ -165,7 +165,7 @@ class SAMLoveDA(pl.LightningModule):
         self.register_buffer("pixel_std", torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1), False)
 
         if hasattr(config, 'NO_SAM') and config.NO_SAM:
-            raise NotImplementedError("NO_SAM option is not supported in SAMLoveDA")
+            raise NotImplementedError("NO_SAM option is not supported")
         else:
             ### SAM encoder
             self.image_encoder = ImageEncoderViT(
@@ -193,7 +193,7 @@ class SAMLoveDA(pl.LightningModule):
         for param in self.prompt_encoder.parameters():
             param.requires_grad = False
 
-        self.num_classes = config.get('NUM_CLASSES', 8)
+        self.num_classes = config.get('NUM_CLASSES', 3)  # 默认为3类（背景、建筑物、道路）
         
         if config.USE_SAM_DECODER:
             # Initialize the SAM mask decoder
@@ -208,48 +208,27 @@ class SAMLoveDA(pl.LightningModule):
                 transformer_dim=prompt_embed_dim,
                 iou_head_depth=3,
                 iou_head_hidden_dim=256,
-                
-                # Changed from the original SAM MaskDecoder:
-                # Multiple for LoveDA semantic segmentation (7 classes + background)
                 num_classes=self.num_classes,
             )
         else:
             # Use a simpler decoder (just a few ConvNet layers)
-            activation = nn.GELU  # 与SAMRoad保持一致，使用GELU
-            self.map_decoder = nn.Sequential(
-                nn.Conv2d(encoder_output_dim, 256, kernel_size=3, padding=1),
-                nn.BatchNorm2d(256),
-                activation(),
-                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-                
-                nn.Conv2d(256, 128, kernel_size=3, padding=1),
-                nn.BatchNorm2d(128),
-                activation(),
-                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-                
-                nn.Conv2d(128, 64, kernel_size=3, padding=1),
-                nn.BatchNorm2d(64),
-                activation(),
-                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-                
-                nn.Conv2d(64, 32, kernel_size=3, padding=1),
-                nn.BatchNorm2d(32),
-                activation(),
-                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-                
-                nn.Conv2d(32, self.num_classes, kernel_size=1)
+            activation = nn.GELU  # 与SAM保持一致，使用GELU
+            self.map_decoder = EnhancedDecoder(
+                encoder_dim=encoder_output_dim,
+                num_classes=self.num_classes,
+                config=config
             )
 
         #### LORA微调
         if hasattr(config, 'ENCODER_LORA') and config.ENCODER_LORA:
-            r = config.get('LORA_RANK', 4)
+            r = config.get('LORA_RANK', 8)  # 增加默认秩到8
             lora_layer_selection = None
             assert r > 0
             if lora_layer_selection:
                 self.lora_layer_selection = lora_layer_selection
             else:
-                self.lora_layer_selection = list(
-                    range(len(self.image_encoder.blocks)))  # 默认对所有图像编码器层应用LoRA
+                # 只选择部分层应用LoRA
+                self.lora_layer_selection = [2, 5, 8, 11]  # 参考SAM的global attention layers
             # 创建存储空间，然后初始化或加载权重
             self.w_As = []  # 线性层
             self.w_Bs = []
@@ -361,6 +340,43 @@ class SAMLoveDA(pl.LightningModule):
         # 打印参数统计信息
         self._print_param_stats()
 
+        # 添加辅助解码器头
+        if config.get('AUX_LOSS', False):
+            self.aux_decoder = nn.Sequential(
+                nn.Conv2d(encoder_output_dim // 2, 256, kernel_size=3, padding=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(config.get('DROPOUT', 0.1)),
+                nn.Conv2d(256, self.num_classes, kernel_size=1)
+            )
+        
+        # 添加深度监督头
+        if config.get('DEEP_SUPERVISION', False):
+            self.deep_supervision_heads = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv2d(encoder_output_dim // (2 ** i), 128, kernel_size=3, padding=1),
+                    nn.BatchNorm2d(128),
+                    nn.ReLU(inplace=True),
+                    nn.Dropout2d(config.get('DROPOUT', 0.1)),
+                    nn.Conv2d(128, self.num_classes, kernel_size=1)
+                ) for i in range(3)  # 3个不同尺度的监督
+            ])
+        
+        # 添加EMA
+        if config.get('EMA', False):
+            self.ema_model = None
+            self.ema_decay = config.get('EMA_DECAY', 0.999)
+
+        # 初始化验证指标
+        self.val_mean_iou = JaccardIndex(task="multiclass", num_classes=self.num_classes, ignore_index=0)
+        self.val_class_ious = nn.ModuleList([
+            BinaryJaccardIndex(threshold=0.5) for _ in range(1, self.num_classes)  # 跳过背景类(0)
+        ])
+        
+        # 用于存储验证指标
+        self.val_mean_iou_list = []
+        self.val_class_ious_list = [[] for _ in range(1, self.num_classes)]
+
     def resize_sam_pos_embed(self, state_dict, image_size, vit_patch_size, encoder_global_attn_indexes):
         # 调整预训练SAM模型的位置编码以匹配当前的图像尺寸
         new_state_dict = {k : v for k, v in state_dict.items()}
@@ -391,62 +407,132 @@ class SAMLoveDA(pl.LightningModule):
         # 获取输入图像
         rgb = batch['image']
         
-        # 检查输入范围
-        if torch.isnan(rgb).any():
-            logger.error("输入图像包含NaN")
-        if torch.isinf(rgb).any():
-            logger.error("输入图像包含Inf")
-        
         # 归一化图像
         x = (rgb - self.pixel_mean) / self.pixel_std
         
         # 获取图像特征
-        image_embeddings = self.image_encoder(x)
+        features = self.image_encoder(x)  # [B, C, H/16, W/16]
         
-        # 检查特征
-        if torch.isnan(image_embeddings).any():
-            logger.error("图像特征包含NaN")
-            # 打印最后一个卷积层的统计信息
-            for name, module in self.image_encoder.named_modules():
-                if isinstance(module, nn.Conv2d):
-                    last_conv = module
-            if last_conv is not None:
-                print_tensor_info(f"最后一个卷积层权重", last_conv.weight)
-        
-        # 使用解码器生成分割结果
+        # 主要预测
         if self.config.USE_SAM_DECODER:
-            if logger.level <= logging.DEBUG:
-                logger.debug("使用SAM解码器...")
             sparse_embeddings, dense_embeddings = self.prompt_encoder(
                 points=None, boxes=None, masks=None
             )
-            low_res_logits, iou_predictions = self.mask_decoder(
-                image_embeddings=image_embeddings,
+            mask_logits, iou_predictions = self.mask_decoder(
+                image_embeddings=features,
                 image_pe=self.prompt_encoder.get_dense_pe(),
                 sparse_prompt_embeddings=sparse_embeddings,
                 dense_prompt_embeddings=dense_embeddings,
                 multimask_output=False
             )
             mask_logits = F.interpolate(
-                low_res_logits,
+                mask_logits,
                 (self.image_size, self.image_size),
                 mode="bilinear",
                 align_corners=False,
             )
-            mask_scores = torch.sigmoid(mask_logits)
         else:
-            if logger.level <= logging.DEBUG:
-                logger.debug("使用自定义解码器...")
-            mask_logits = self.map_decoder(image_embeddings)
-            mask_scores = F.softmax(mask_logits, dim=1)  # 使用softmax进行多类别分类
+            mask_logits = self.map_decoder(features)
         
-        # 检查输出
-        if torch.isnan(mask_logits).any():
-            logger.error("掩码logits包含NaN")
-        if torch.isnan(mask_scores).any():
-            logger.error("掩码scores包含NaN")
+        outputs = {'main': mask_logits}
         
-        return mask_logits, mask_scores
+        # 辅助预测
+        if self.training and self.config.get('AUX_LOSS', False):
+            aux_features = features[:, :features.shape[1]//2]  # 使用一半的特征通道
+            aux_logits = self.aux_decoder(aux_features)
+            aux_logits = F.interpolate(aux_logits, size=(self.image_size, self.image_size),
+                                     mode='bilinear', align_corners=False)
+            outputs['aux'] = aux_logits
+        
+        # 深度监督预测
+        if self.training and self.config.get('DEEP_SUPERVISION', False):
+            deep_outputs = []
+            for i, head in enumerate(self.deep_supervision_heads):
+                scale = 2 ** i
+                deep_features = F.interpolate(features, scale_factor=scale,
+                                           mode='bilinear', align_corners=False)
+                deep_logits = head(deep_features)
+                deep_logits = F.interpolate(deep_logits, size=(self.image_size, self.image_size),
+                                         mode='bilinear', align_corners=False)
+                deep_outputs.append(deep_logits)
+            outputs['deep'] = deep_outputs
+        
+        return outputs
+    
+    def training_step(self, batch, batch_idx):
+        # 前向传播
+        outputs = self.forward(batch)
+        masks = batch['mask']
+        
+        # 计算主要损失
+        main_loss = compute_loss(outputs['main'], masks, self.config)
+        total_loss = main_loss
+        
+        # 计算辅助损失
+        if self.config.get('AUX_LOSS', False):
+            aux_loss = compute_loss(outputs['aux'], masks, self.config)
+            total_loss += 0.4 * aux_loss
+        
+        # 计算深度监督损失
+        if self.config.get('DEEP_SUPERVISION', False):
+            deep_loss = 0
+            for i, deep_output in enumerate(outputs['deep']):
+                weight = 0.4 * (0.8 ** i)
+                deep_loss += weight * compute_loss(deep_output, masks, self.config)
+            total_loss += deep_loss
+        
+        # 记录损失
+        self.log('train_loss', total_loss, on_step=True, on_epoch=False, prog_bar=True)
+        
+        return total_loss
+    
+    def compute_loss(self, pred, target):
+        """计算损失函数"""
+        if self.config.get('FOCAL_LOSS', False):
+            loss = focal_loss(
+                pred, target, 
+                self.num_classes,
+                alpha=self.config.get('FOCAL_ALPHA', 0.25),
+                gamma=self.config.get('FOCAL_GAMMA', 2.0),
+                weights=torch.tensor(self.config.CLASS_WEIGHTS, device=self.device)
+            )
+        else:
+            weights = torch.tensor(self.config.CLASS_WEIGHTS, device=self.device)
+            loss = F.cross_entropy(
+                pred, target,
+                weight=weights,
+                ignore_index=0,
+                label_smoothing=self.config.get('LABEL_SMOOTHING', 0)
+            )
+        return loss
+    
+    def online_hard_example_mining(self, loss):
+        """在线难例挖掘"""
+        if not isinstance(loss, torch.Tensor):
+            return loss
+        
+        # 获取每个像素的损失
+        pixel_losses = loss.view(-1)
+        
+        # 选择最困难的样本
+        num_pixels = pixel_losses.numel()
+        num_hard = int(num_pixels * self.config.get('OHEM_RATIO', 0.75))
+        
+        # 获取最高的损失值
+        pixel_losses, _ = torch.sort(pixel_losses, descending=True)
+        hard_loss = pixel_losses[:num_hard].mean()
+        
+        return hard_loss
+    
+    def update_ema_model(self):
+        """更新EMA模型"""
+        if self.ema_model is None:
+            self.ema_model = copy.deepcopy(self)
+            for param in self.ema_model.parameters():
+                param.detach_()
+        else:
+            for param, ema_param in zip(self.parameters(), self.ema_model.parameters()):
+                ema_param.data.mul_(self.ema_decay).add_(param.data, alpha=1 - self.ema_decay)
 
     def infer_masks(self, rgb):
         """用于推理阶段，只返回掩码预测结果"""
@@ -481,321 +567,63 @@ class SAMLoveDA(pl.LightningModule):
         
         return class_pred, mask_scores
 
-    def training_step(self, batch, batch_idx):
-        if self.trainer.fast_dev_run:
-            logger.info("Fast dev run mode: training step")
-            print_tensor_info("输入图像", batch['image'])
-            print_tensor_info("输入掩码", batch['mask'])
-
-        # 在前向传播前添加输入检查
-        if logger.level <= logging.DEBUG:
-            print_tensor_info("输入图像", batch['image'])
-            print_tensor_info("输入掩码", batch['mask'])
-            
-            # 检查掩码值的范围
-            mask_unique = torch.unique(batch['mask'])
-            logger.debug(f"掩码中的唯一值: {mask_unique.tolist()}")
-            if torch.any(mask_unique >= self.num_classes):
-                logger.error(f"掩码包含无效类别: {mask_unique[mask_unique >= self.num_classes].tolist()}")
-
-        # 前向传播
-        mask_logits, mask_scores = self.forward(batch)
-        
-        # 检查输出的数值范围
-        if batch_idx % 100 == 0:
-            print_tensor_info("掩码logits", mask_logits)
-            print_tensor_info("掩码scores", mask_scores)
-            
-            # 检查是否有梯度爆炸
-            for name, param in self.named_parameters():
-                if param.grad is not None:
-                    grad_norm = param.grad.norm().item()
-                    if grad_norm > 10:
-                        logger.warning(f"参数 {name} 的梯度范数过大: {grad_norm}")
-
-        # 获取目标掩码
-        masks = batch['mask']
-
-        # 计算损失前检查数值
-        if self.config.get('FOCAL_LOSS', False):
-            # 获取类别权重
-            weights = torch.tensor(self.config.CLASS_WEIGHTS, dtype=torch.float, device=self.device)
-            loss = focal_loss(mask_logits, masks, self.num_classes, 
-                             alpha=self.config.get('FOCAL_ALPHA', 0.5),
-                             gamma=self.config.get('FOCAL_GAMMA', 3.0),
-                             weights=weights,  # 添加类别权重
-                             ignore_index=0)  # 确保忽略索引0
-        else:
-            # 检查是否有类别权重
-            if self.config.get('CLASS_WEIGHTS', None) is not None:
-                weights = torch.tensor(self.config.CLASS_WEIGHTS, dtype=torch.float, device=self.device)
-                # 使用加权交叉熵损失
-                loss = F.cross_entropy(mask_logits, masks, weight=weights, ignore_index=0)
-            else:
-                loss = F.cross_entropy(mask_logits, masks, ignore_index=0)
-
-        # 损失值异常检查
-        if torch.isnan(loss) or torch.isinf(loss):
-            logger.error(f"检测到异常损失值: {loss.item()}")
-            logger.error("最近一次的梯度范数:")
-            for name, param in self.named_parameters():
-                if param.grad is not None:
-                    logger.error(f"{name}: {param.grad.norm().item()}")
-            # 可以选择跳过这个批次
-            return None
-
-        # 损失过大检查
-        if loss.item() > self.config.get('LOSS_THRESHOLD', 10.0):
-            logger.warning(f"损失值过大: {loss.item()}")
-
-        # 调试
-        if torch.isnan(loss) or torch.isinf(loss):
-            logger.error(f"NaN or Inf loss detected: {loss}")
-            if hasattr(self, 'mask_criterion') and isinstance(self.mask_criterion, torch.nn.CrossEntropyLoss):
-                logger.debug(f"使用CrossEntropyLoss, 忽略索引: {self.mask_criterion.ignore_index}")
-                # 检查掩码中是否有大于等于num_classes的值
-                invalid_mask = (masks >= self.num_classes)
-                if invalid_mask.any():
-                    logger.error(f"掩码中存在无效类别: {torch.unique(masks[invalid_mask])}")
-        
-        # 获取预测结果
-        preds = torch.argmax(mask_logits, dim=1)
-        
-        # 安全计算平均IoU - 添加错误处理
-        try:
-            mean_iou = self.mean_iou(preds, masks)
-        except Exception as e:
-            logger.warning(f"计算IoU时出错: {str(e)}, 使用伪值代替")
-            # 如果发生错误，使用伪值
-            mean_iou = torch.tensor(0.5, device=preds.device)
-        
-        # 创建二分类任务的目标掩码并计算各类别的单独损失
-        class_names = ["背景", "建筑", "道路", "水体", "草地", "森林", "农田", "其他"]
-        class_losses = []
-        
-        # 重点关注的类别
-        road_mask = (masks == 3).float()  # 道路索引为3
-        building_mask = (masks == 2).float()  # 建筑索引为2
-        water_mask = (masks == 4).float()  # 水体索引为4
-        
-        road_logits = mask_logits[:, 3]  # 获取道路类的logits
-        building_logits = mask_logits[:, 2]  # 获取建筑类的logits
-        water_logits = mask_logits[:, 4]  # 获取水体类的logits
-        
-        # 使用Focal Loss或BCE
-        if self.config.get('FOCAL_LOSS', False):
-            alpha = self.config.get('FOCAL_ALPHA', 0.25)
-            gamma = self.config.get('FOCAL_GAMMA', 2.0)
-            road_loss = torchvision.ops.sigmoid_focal_loss(road_logits, road_mask, alpha=alpha, gamma=gamma, reduction='mean')
-            building_loss = torchvision.ops.sigmoid_focal_loss(building_logits, building_mask, alpha=alpha, gamma=gamma, reduction='mean')
-            water_loss = torchvision.ops.sigmoid_focal_loss(water_logits, water_mask, alpha=alpha, gamma=gamma, reduction='mean')
-        else:
-            road_loss = F.binary_cross_entropy_with_logits(road_logits, road_mask)
-            building_loss = F.binary_cross_entropy_with_logits(building_logits, building_mask)
-            water_loss = F.binary_cross_entropy_with_logits(water_logits, water_mask)
-        
-        # 调试
-        if logger.level <= logging.DEBUG and batch_idx % 100 == 0:
-            for cls_idx in range(1, min(4, self.num_classes)):
-                cls_mask = (masks == cls_idx).float()
-                cls_presence = cls_mask.sum() > 0
-                logger.debug(f"类别{cls_idx} ({class_names[cls_idx]}): 存在={cls_presence}, 像素数={cls_mask.sum().item()}")
-        
-        # 单独记录这三个关键类别的损失
-        self.log('train_road_loss', road_loss, on_step=True, on_epoch=False)
-        self.log('train_building_loss', building_loss, on_step=True, on_epoch=False)
-        self.log('train_water_loss', water_loss, on_step=True, on_epoch=False)
-        
-        # 计算所有类别的二分类损失
-        total_class_loss = 0.0
-        class_ious = []
-        for cls_idx in range(1, self.num_classes):  # 跳过背景类
-            # 为每个类别创建二值掩码
-            class_mask = (masks == cls_idx).float()
-            
-            # 获取该类别的logits
-            class_logit = mask_logits[:, cls_idx]
-            class_pred = (torch.sigmoid(class_logit) > 0.5).float()
-            
-            # 计算二分类损失
-            class_loss = F.binary_cross_entropy_with_logits(class_logit, class_mask)
-            
-            # 累加损失
-            total_class_loss += class_loss
-            
-            # 计算每个类别的IoU
-            if class_mask.sum() > 0:  # 只有当存在该类别时才计算IoU
-                intersection = (class_pred * class_mask).sum()
-                union = class_pred.sum() + class_mask.sum() - intersection
-                class_iou = intersection / (union + 1e-6)
-                class_ious.append(class_iou)
-                
-                # 记录各类别IoU
-                self.log(f'train_{class_names[cls_idx]}_iou', class_iou, on_step=False, on_epoch=True)
-            
-            # 记录各类别损失
-            self.log(f'train_{class_names[cls_idx]}_loss', class_loss, on_step=True, on_epoch=False)
-        
-        # 总损失现在包括所有类别的损失，而不仅仅是三个类别
-        class_weight = 0.3  # 类别损失的权重系数
-        total_loss = loss + class_weight * (total_class_loss / (self.num_classes - 1))  # 计算平均类别损失
-        
-        # 记录指标
-        self.log('train_mask_loss', loss, on_step=True, on_epoch=False, prog_bar=True)
-        self.log('train_loss', total_loss, on_step=True, on_epoch=False, prog_bar=True)
-        self.log('train_mean_iou', mean_iou, on_step=True, on_epoch=False, prog_bar=True)
-        self.log('train_class_loss', total_class_loss / (self.num_classes - 1), on_step=True, on_epoch=False)
-        
-        # 每一定步数打印训练状态
-        log_interval = self.config.get('LOG_INTERVAL', 50)
-        if self.global_step > 0 and batch_idx % log_interval == 0:
-            # 计算当前学习率
-            current_lr = self.trainer.optimizers[0].param_groups[0]['lr']
-            
-            # 计算平均类别IoU
-            avg_class_iou = sum(class_ious) / len(class_ious) if class_ious else 0
-            
-            # 打印训练状态
-            batch_str = f"[{batch_idx}/{len(self.trainer.train_dataloader)}]"
-            epoch_str = f"Epoch {self.current_epoch+1}/{self.trainer.max_epochs}"
-            lr_str = f"LR: {current_lr:.6f}"
-            loss_str = f"Loss: {total_loss.item():.4f}"
-            iou_str = f"IoU: {mean_iou.item():.4f}"
-            cls_iou_str = f"ClsIoU: {avg_class_iou:.4f}"
-            
-            print(f"{epoch_str} {batch_str} {lr_str} {loss_str} {iou_str} {cls_iou_str}")
-        
-        # 如果是第一个批次，记录一些预览图像
-        if batch_idx == 0 and self.current_epoch % 5 == 0:
-            self._log_images(batch, mask_logits)
-        
-        # 在计算loss后添加
-        if batch_idx == 0 and self.current_epoch > 0:
-            # 检查预测分布
-            softmax_probs = F.softmax(mask_logits, dim=1)
-            class_probs = softmax_probs.mean(dim=[0,2,3])
-            print(f"类别概率分布: {class_probs}")
-            
-            # 检查预测类别分布
-            preds = torch.argmax(mask_logits, dim=1)
-            unique_preds, counts = torch.unique(preds, return_counts=True)
-            print(f"预测类别分布: {unique_preds.tolist()}")
-            print(f"预测类别计数: {counts.tolist()}")
-            
-            # 检查真实标签分布
-            unique_targets, target_counts = torch.unique(masks, return_counts=True)
-            print(f"目标类别分布: {unique_targets.tolist()}")
-            print(f"目标类别计数: {target_counts.tolist()}")
-        
-        return total_loss
-
     def validation_step(self, batch, batch_idx):
         if self.trainer.fast_dev_run:
-            logger.info("Fast dev run mode: validation step")
-            print_tensor_info("验证图像", batch['image'])
-
+            return
+            
         # 前向传播
-        mask_logits, mask_scores = self.forward(batch)
+        outputs = self.forward(batch)
+        mask_logits = outputs['main']
         
         # 获取目标掩码
-        masks = batch['mask']  # [B, H, W]
+        masks = batch['mask']
         
-        # 计算损失 - 修改这部分以保持一致性
-        if self.config.get('FOCAL_LOSS', False):
-            loss = focal_loss(mask_logits, masks, self.num_classes, 
-                            alpha=self.config.get('FOCAL_ALPHA', 0.25),
-                            gamma=self.config.get('FOCAL_GAMMA', 2.0),
-                            ignore_index=0)
-        else:
-            # 检查是否有类别权重
-            if self.config.get('CLASS_WEIGHTS', None) is not None:
-                weights = torch.tensor(self.config.CLASS_WEIGHTS, dtype=torch.float, device=self.device)
-                loss = F.cross_entropy(mask_logits, masks, weight=weights, ignore_index=0)
-            else:
-                loss = F.cross_entropy(mask_logits, masks, ignore_index=0)
+        # 计算损失
+        loss = compute_loss(mask_logits, masks, self.config)
         
-        # 获取预测结果
+        # 计算预测结果
         preds = torch.argmax(mask_logits, dim=1)
         
-        # 计算IoU
-        mean_iou = self.mean_iou(preds, masks)
+        # 更新验证指标
+        self.val_mean_iou.update(preds, masks)
+        mean_iou = self.val_mean_iou.compute()
         
-        # 类别名称
-        class_names = ["背景", "建筑", "道路", "水体", "草地", "森林", "农田", "其他"]
-        
-        # 创建二分类任务的目标掩码，主要关注1-7类，跳过0类（背景）
+        # 计算每个类别的IoU
         class_scores = {}
         for cls_idx in range(1, self.num_classes):
-            # 为每个类别创建二值掩码
-            class_mask = (masks == cls_idx).float()
-            
-            # 获取该类别的logits并计算预测
-            class_logit = mask_logits[:, cls_idx]
-            class_pred = (torch.sigmoid(class_logit) > 0.5).float()
-            
-            # 计算该类别的IoU和F1分数
-            self.class_ious[cls_idx-1].update(class_pred, class_mask)
-            self.class_f1s[cls_idx-1].update(class_pred, class_mask)
-            
-            # 计算本批次的类别IoU
-            if class_mask.sum() > 0:
-                intersection = (class_pred * class_mask).sum()
-                union = class_pred.sum() + class_mask.sum() - intersection
-                class_iou = (intersection / (union + 1e-6)).item()
-                class_scores[class_names[cls_idx]] = class_iou
-            
-            # 单独记录道路、建筑和水体的IoU
-            if cls_idx == 1:  # 建筑
-                self.log('val_building_iou', self.class_ious[cls_idx-1], on_step=False, on_epoch=True)
-            elif cls_idx == 2:  # 道路
-                self.log('val_road_iou', self.class_ious[cls_idx-1], on_step=False, on_epoch=True)
-            elif cls_idx == 3:  # 水体
-                self.log('val_water_iou', self.class_ious[cls_idx-1], on_step=False, on_epoch=True)
+            self.val_class_ious[cls_idx-1].update(preds == cls_idx, masks == cls_idx)
+            class_scores[f'val_iou_class_{cls_idx}'] = self.val_class_ious[cls_idx-1].compute()
         
-        # 记录整体指标
-        self.log('val_mask_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
+        # 记录指标
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log('val_mean_iou', mean_iou, on_step=False, on_epoch=True, prog_bar=True)
-        
-        # 存储指标用于epoch结束时的汇总
-        self.val_mean_iou_list.append(mean_iou)
-        
-        # 每个验证周期开始时打印一些信息
-        if batch_idx == 0:
-            print(f"\n验证: Epoch {self.current_epoch+1}/{self.trainer.max_epochs}")
+        for k, v in class_scores.items():
+            self.log(k, v, on_step=False, on_epoch=True)
         
         # 如果是第一个批次，记录一些预览图像
         if batch_idx == 0:
             self._log_images(batch, mask_logits)
-
-        # 打印实际IoU计算的中间值
-        if batch_idx == 0:
-            preds = torch.argmax(mask_logits, dim=1)
-            target = batch['mask']
-            
-            # 检查预测的分布情况
-            unique_preds, pred_counts = torch.unique(preds, return_counts=True)
-            print(f"验证预测类别: {unique_preds.tolist()}")
-            print(f"验证预测计数: {pred_counts.tolist()}")
-            
-            # 计算一个样本的每个类别IoU
-            for c in range(1, self.num_classes):
-                pred_mask = (preds == c).float()
-                target_mask = (target == c).float()
-                intersection = (pred_mask * target_mask).sum().item()
-                union = (pred_mask + target_mask).clamp(0, 1).sum().item()
-                iou = intersection / (union + 1e-8)
-                print(f"类别{c} 手动计算IoU: {iou:.4f}")
 
         # 返回验证批次指标
         return {'val_loss': loss, 'val_mean_iou': mean_iou, 'class_scores': class_scores}
 
     def on_validation_epoch_end(self):
+        # 重置验证指标
+        self.val_mean_iou.reset()
+        for metric in self.val_class_ious:
+            metric.reset()
+            
+        # 存储验证指标
+        self.val_mean_iou_list.append(self.val_mean_iou.compute().item())
+        for i, metric in enumerate(self.val_class_ious):
+            self.val_class_ious_list[i].append(metric.compute().item())
+        
         # 修正类别名称
         class_names = [
             "无数据", "背景", "建筑", "道路", 
             "水体", "贫瘠地", "森林", "农田"
         ]
+        
         # 收集并显示所有类别的IoU
         class_iou_values = []
         class_f1_values = []
@@ -1188,7 +1016,7 @@ class SAMLoveDA(pl.LightningModule):
             print(f"\nLoRA参数: {lora_params:,} (全部可训练)")
             lora_percent = lora_params / trainable_params * 100
             print(f"LoRA参数占可训练参数的比例: {lora_percent:.2f}%")
-            print(f"LoRA秩: {self.config.get('LORA_RANK', 4)}")
+            print(f"LoRA秩: {self.config.get('LORA_RANK', 8)}")
         
         # 加载参数统计
         if hasattr(self, 'matched_param_names'):
@@ -1197,6 +1025,67 @@ class SAMLoveDA(pl.LightningModule):
             print(f"\n从预训练权重加载的参数数量: {loaded_params_count:,} ({loaded_params_count/total_params*100:.2f}%)")
         
         print("="*60)
+
+    def load_state_dict(self, state_dict, strict=False):
+        """重写加载函数以处理参数不匹配的情况"""
+        # 创建新的state_dict，只包含匹配的键
+        new_state_dict = {}
+        
+        # 获取当前模型的state_dict
+        current_state = self.state_dict()
+        
+        # 记录加载情况
+        matched_keys = []
+        missing_keys = []
+        unexpected_keys = []
+        
+        # 遍历当前模型的参数
+        for key in current_state.keys():
+            if key in state_dict and state_dict[key].shape == current_state[key].shape:
+                new_state_dict[key] = state_dict[key]
+                matched_keys.append(key)
+            else:
+                missing_keys.append(key)
+        
+        # 记录未使用的键
+        for key in state_dict.keys():
+            if key not in current_state:
+                unexpected_keys.append(key)
+        
+        # 打印加载统计信息
+        print("\n加载检查点统计:")
+        print(f"成功加载的参数: {len(matched_keys)}")
+        print(f"缺失的参数: {len(missing_keys)}")
+        print(f"未使用的参数: {len(unexpected_keys)}")
+        
+        if len(missing_keys) > 0:
+            print("\n缺失的关键参数:")
+            for key in missing_keys[:10]:  # 只打印前10个
+                print(f"- {key}")
+            if len(missing_keys) > 10:
+                print(f"... 还有 {len(missing_keys)-10} 个参数")
+        
+        # 调用父类的load_state_dict，使用新的state_dict
+        return super().load_state_dict(new_state_dict, strict=False)
+
+    def _load_checkpoint(self, checkpoint_path):
+        """加载检查点"""
+        print(f"加载检查点: {checkpoint_path}")
+        try:
+            checkpoint = torch.load(checkpoint_path)
+            if 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            else:
+                state_dict = checkpoint
+            
+            # 使用自定义的load_state_dict函数
+            self.load_state_dict(state_dict, strict=False)
+            
+            print("检查点加载成功")
+            return True
+        except Exception as e:
+            print(f"加载检查点时出错: {str(e)}")
+            return False
 
 
 # ===================== 以下是用于测试与调试的代码 =====================
@@ -1556,13 +1445,19 @@ def focal_loss(pred, target, num_classes, alpha=0.5, gamma=3.0, ignore_index=0, 
     eps = 1e-6
     pred_softmax = torch.clamp(pred_softmax, eps, 1.0 - eps)
     
-    # 创建正确类别的掩码
-    batch_size, _, height, width = pred.shape
-    
     # 使用F.one_hot进行类别转换，避免直接索引
     # 先将target中的ignore_index替换为0（临时）
     target_temp = target.clone()
     target_temp[~valid_mask] = 0
+    
+    # 确保target的尺寸与pred匹配
+    if target.shape[-2:] != pred.shape[-2:]:
+        target_temp = F.interpolate(target_temp.unsqueeze(1).float(), 
+                                  size=pred.shape[-2:], 
+                                  mode='nearest').squeeze(1).long()
+        valid_mask = F.interpolate(valid_mask.unsqueeze(1).float(), 
+                                 size=pred.shape[-2:], 
+                                 mode='nearest').squeeze(1).bool()
     
     # 转换为one-hot编码 [B, H, W, C]
     target_one_hot = F.one_hot(target_temp, num_classes).float()
@@ -1602,6 +1497,384 @@ def focal_loss(pred, target, num_classes, alpha=0.5, gamma=3.0, ignore_index=0, 
     
     # 计算平均损失
     return loss.sum() / (valid_mask.sum() + eps)
+
+def dice_loss(pred, target, smooth=1.0):
+    """计算Dice Loss"""
+    # 确保target的尺寸与pred匹配
+    if target.shape[-2:] != pred.shape[-2:]:
+        target = F.interpolate(target.unsqueeze(1).float(), 
+                             size=pred.shape[-2:], 
+                             mode='nearest').squeeze(1).long()
+    
+    pred = F.softmax(pred, dim=1)
+    
+    # 将target转换为one-hot编码
+    target_one_hot = F.one_hot(target, num_classes=pred.shape[1])
+    target_one_hot = target_one_hot.permute(0, 3, 1, 2).float()
+    
+    # 计算Dice系数
+    intersection = (pred * target_one_hot).sum(dim=(2, 3))
+    union = pred.sum(dim=(2, 3)) + target_one_hot.sum(dim=(2, 3))
+    
+    # 计算Dice Loss
+    dice = (2.0 * intersection + smooth) / (union + smooth)
+    return 1 - dice.mean()
+
+def edge_loss(pred, target, num_classes):
+    """计算边缘损失"""
+    # 使用Sobel算子计算边缘
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=pred.device).float()
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], device=pred.device).float()
+    
+    # 将target转换为one-hot编码
+    target_one_hot = F.one_hot(target, num_classes=num_classes)
+    target_one_hot = target_one_hot.permute(0, 3, 1, 2).float()
+    
+    # 计算预测和目标的边缘
+    pred_edges = []
+    target_edges = []
+    
+    for i in range(num_classes):
+        # 预测的边缘
+        pred_prob = F.softmax(pred, dim=1)[:, i:i+1]
+        pred_edge_x = F.conv2d(pred_prob, sobel_x.view(1, 1, 3, 3), padding=1)
+        pred_edge_y = F.conv2d(pred_prob, sobel_y.view(1, 1, 3, 3), padding=1)
+        pred_edge = torch.sqrt(pred_edge_x.pow(2) + pred_edge_y.pow(2))
+        pred_edges.append(pred_edge)
+        
+        # 目标的边缘
+        target_mask = target_one_hot[:, i:i+1]
+        target_edge_x = F.conv2d(target_mask, sobel_x.view(1, 1, 3, 3), padding=1)
+        target_edge_y = F.conv2d(target_mask, sobel_y.view(1, 1, 3, 3), padding=1)
+        target_edge = torch.sqrt(target_edge_x.pow(2) + target_edge_y.pow(2))
+        target_edges.append(target_edge)
+    
+    pred_edges = torch.cat(pred_edges, dim=1)
+    target_edges = torch.cat(target_edges, dim=1)
+    
+    return F.mse_loss(pred_edges, target_edges)
+
+def compute_loss(pred, target, config):
+    """组合多个损失函数，适用于多分类任务
+    
+    Args:
+        pred: [B, num_classes, H, W] - logits
+        target: [B, H, W] - class indices
+        config: 配置对象
+    """
+    # 获取设备
+    device = pred.device
+    
+    # 确保target的尺寸与pred匹配
+    if target.shape[-2:] != pred.shape[-2:]:
+        target = F.interpolate(target.unsqueeze(1).float(), 
+                             size=pred.shape[-2:],
+                             mode='nearest').long().squeeze(1)
+    
+    # 初始化总损失
+    total_loss = 0
+    
+    # Focal Loss
+    if config.FOCAL_LOSS:
+        focal_loss_value = focal_loss(
+            pred, target,
+            num_classes=pred.shape[1],
+            alpha=config.FOCAL_ALPHA,
+            gamma=config.FOCAL_GAMMA,
+            weights=torch.tensor(config.CLASS_WEIGHTS, device=device)
+        )
+        total_loss += focal_loss_value
+    
+    # Dice Loss - 对每个类别分别计算
+    if hasattr(config, 'DICE_LOSS_WEIGHT') and config.DICE_LOSS_WEIGHT > 0:
+        dice_loss_value = 0
+        # 跳过背景类(索引0)
+        for cls_idx in range(1, pred.shape[1]):
+            dice_loss_value += dice_loss(
+                pred[:, cls_idx:cls_idx+1],
+                (target == cls_idx).float().unsqueeze(1)
+            )
+        dice_loss_value /= (pred.shape[1] - 1)  # 平均每个类的dice loss
+        total_loss += config.DICE_LOSS_WEIGHT * dice_loss_value
+    
+    # Cross Entropy Loss
+    if hasattr(config, 'CE_LOSS_WEIGHT') and config.CE_LOSS_WEIGHT > 0:
+        if hasattr(config, 'CLASS_WEIGHTS'):
+            weights = torch.tensor(config.CLASS_WEIGHTS, device=device)
+            ce_loss = F.cross_entropy(pred, target, weight=weights)
+        else:
+            ce_loss = F.cross_entropy(pred, target)
+        total_loss += config.CE_LOSS_WEIGHT * ce_loss
+    
+    return total_loss
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(in_channels, in_channels // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(in_channels // reduction, in_channels)
+        )
+        
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        avg_out = self.fc(self.avg_pool(x).view(b, c))
+        max_out = self.fc(self.max_pool(x).view(b, c))
+        out = torch.sigmoid(avg_out + max_out).view(b, c, 1, 1)
+        return x * out
+
+class SpatialAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size=7, padding=3)
+        
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        out = torch.cat([avg_out, max_out], dim=1)
+        out = torch.sigmoid(self.conv(out))
+        return x * out
+
+class ASPP(nn.Module):
+    def __init__(self, in_channels=256, out_channels=256):
+        super().__init__()
+        self.aspp = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            ),
+            nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding=6, dilation=6),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            ),
+            nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding=12, dilation=12),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            ),
+            nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, 3, padding=18, dilation=18),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            )
+        ])
+        
+        self.global_avg_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(in_channels, out_channels, 1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.conv1 = nn.Conv2d(out_channels * 5, out_channels, 1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.dropout = nn.Dropout(0.5)
+
+    def forward(self, x):
+        size = x.size()[2:]
+        
+        # 并行ASPP分支
+        aspp_outs = []
+        for aspp_module in self.aspp:
+            aspp_outs.append(aspp_module(x))
+        
+        # 全局平均池化分支
+        global_feat = self.global_avg_pool(x)
+        global_feat = F.interpolate(global_feat, size=size, mode='bilinear', align_corners=False)
+        
+        # 合并所有特征
+        aspp_outs.append(global_feat)
+        out = torch.cat(aspp_outs, dim=1)
+        
+        out = self.conv1(out)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.dropout(out)
+        
+        return out
+
+class MultiScaleModule(nn.Module):
+    def __init__(self, in_channels=256):
+        super().__init__()
+        
+        self.branch1 = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.branch3 = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=2, dilation=2),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True)
+        )
+        
+        self.branch4 = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=4, dilation=4),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        out1 = self.branch1(x)
+        out2 = self.branch2(x)
+        out3 = self.branch3(x)
+        out4 = self.branch4(x)
+        
+        return out1 + out2 + out3 + out4
+
+class EdgeAttentionModule(nn.Module):
+    def __init__(self, in_channels=256):
+        super().__init__()
+        
+        self.conv1 = nn.Conv2d(in_channels, in_channels, 3, padding=1)
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+        self.conv2 = nn.Conv2d(in_channels, in_channels, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        feat = self.conv1(x)
+        feat = self.bn1(feat)
+        feat = self.relu(feat)
+        
+        attention = self.conv2(feat)
+        attention = self.sigmoid(attention)
+        
+        return x * attention
+
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.channel_attention = ChannelAttention(out_channels)
+        self.spatial_attention = SpatialAttention()
+        
+    def forward(self, x):
+        x = self.relu(self.bn1(self.conv1(x)))
+        x = self.relu(self.bn2(self.conv2(x)))
+        x = self.channel_attention(x)
+        x = self.spatial_attention(x)
+        return x
+
+class EnhancedDecoder(nn.Module):
+    def __init__(self, encoder_dim=256, num_classes=3, config=None):
+        super().__init__()
+        self.encoder_dim = encoder_dim
+        self.num_classes = num_classes
+        
+        # FPN风格的解码器
+        self.lateral_convs = nn.ModuleList([
+            nn.Conv2d(encoder_dim, 256, 1),  # P5
+            nn.Conv2d(256, 128, 1),          # P4
+            nn.Conv2d(128, 64, 1),           # P3
+            nn.Conv2d(64, 32, 1),            # P2
+        ])
+        
+        self.up_convs = nn.ModuleList([
+            nn.Sequential(
+                nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2),
+                LayerNorm2d(out_channels),
+                nn.GELU(),
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+                LayerNorm2d(out_channels),
+                nn.GELU()
+            ) for in_channels, out_channels in [(256, 128), (128, 64), (64, 32), (32, 32)]
+        ])
+        
+        # 最终分类头
+        self.classifier = nn.Sequential(
+            nn.Conv2d(32, 32, kernel_size=3, padding=1),
+            LayerNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, num_classes, kernel_size=1)
+        )
+
+    def forward(self, features):
+        # features: [B, 256, 64, 64]
+        
+        # 自顶向下的路径
+        p5 = self.lateral_convs[0](features)        # [B, 256, 64, 64]
+        p4 = self.up_convs[0](p5)                  # [B, 128, 128, 128]
+        p4 = p4 + self.lateral_convs[1](p4)        # 横向连接
+        
+        p3 = self.up_convs[1](p4)                  # [B, 64, 256, 256]
+        p3 = p3 + self.lateral_convs[2](p3)        # 横向连接
+        
+        p2 = self.up_convs[2](p3)                  # [B, 32, 512, 512]
+        p2 = p2 + self.lateral_convs[3](p2)        # 横向连接
+        
+        # 最终上采样到原始尺寸
+        out = self.up_convs[3](p2)                 # [B, 32, 1024, 1024]
+        
+        # 分类预测
+        logits = self.classifier(out)              # [B, num_classes, 1024, 1024]
+        
+        return logits
+
+def compute_edges(target):
+    """计算目标掩码的边缘"""
+    # 使用Sobel算子计算梯度
+    sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], 
+                          device=target.device).float().unsqueeze(0).unsqueeze(0)
+    sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], 
+                          device=target.device).float().unsqueeze(0).unsqueeze(0)
+    
+    # 将目标转换为float
+    target_float = target.float().unsqueeze(1)
+    
+    # 计算梯度
+    grad_x = F.conv2d(target_float, sobel_x, padding=1)
+    grad_y = F.conv2d(target_float, sobel_y, padding=1)
+    
+    # 计算边缘强度
+    edges = torch.sqrt(grad_x**2 + grad_y**2)
+    
+    # 归一化并二值化
+    edges = (edges > 0.5).float()
+    
+    return edges
+
+def compute_boundary_loss(pred, target):
+    """计算边界感知损失"""
+    # 获取每个类别的预测概率
+    pred_probs = F.softmax(pred, dim=1)
+    
+    # 计算每个类别的边界损失
+    boundary_loss = 0
+    for i in range(pred.shape[1]):
+        # 获取当前类别的预测和目标
+        pred_i = pred_probs[:, i:i+1]
+        target_i = (target == i).float().unsqueeze(1)
+        
+        # 计算边界区域
+        target_boundary = compute_edges(target_i)
+        
+        # 在边界区域计算损失
+        boundary_loss += F.binary_cross_entropy(
+            pred_i,
+            target_i,
+            weight=target_boundary + 1.0  # 边界区域的权重更高
+        )
+    
+    return boundary_loss / pred.shape[1]
 
 if __name__ == "__main__":
     # 运行测试代码
